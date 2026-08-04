@@ -6,66 +6,71 @@
 
 // =============================================================
 // PicLink.h
-// Recepcion UART del frame que manda el PIC gateway (formato definido en
-// gw2esp.h del firmware del PIC -- 18 bytes: header + gatewayId +
-// gatewayAddr + 1 registro de nodo (12 bytes) + crc16 + footer). El
-// gateway manda un frame por CADA nodo que reporta OK (addr 1..15,
-// directo, sin buffer ni ACK -- ver nota en gw2esp.h del PIC) mas 1
-// "latido" por ronda (addr=0, en el segundo 50) que es el UNICO que
-// espera el ACK de vuelta (8 bytes: header+fraccion+segundero+minuto+
-// crc16+footer, formato esp2gw_ack_t de gw2esp.c) para resincronizar el
-// synctime/minuto del PIC.
+//
+// Protocolo picg <-> ESP32 (2026-07-31, reemplaza el frame agregado de 186
+// bytes -- ver comentario grande en gw2esp.h del lado picg para el diseño
+// completo). 2 tipos de frame, cada uno con su propio ACK inmediato:
+//
+//   NODO   (picg -> ESP32, hasta 15x por ronda, 1 por segundo en el
+//           drenado): relay de 1 registro de UTA. 13 bytes, CRC16 completo
+//           (lleva dato de medicion real). Sin gatewayId/gatewayAddr --
+//           sacados 2026-07-31, no tenian uso real todavia (ni display ni
+//           nube), se agregan el dia que haga falta un multi-gateway real.
+//           Tampoco lleva fraccion/segundero/minuto del nodo (mismo dia) --
+//           el reloj del nodo no aporta nada nuevo, ver ra01.h del lado
+//           picg. ACK: 5 bytes, confirma addr.
+//   RESYNC (picg -> ESP32, 1x por ronda, al final del drenado): trae
+//           cuantos ticks propios paso el picg desde el ultimo resync
+//           CONFIRMADO (o el sentinel GW2ESP_ELAPSED_SENTINEL si no es
+//           confiable -- boot o se salteo mas de 1 ronda) + flag de reset
+//           propio. 7 bytes, checksum XOR (frame de control, sin dato de
+//           medicion). El ESP32 compara ese elapsed contra lo que el
+//           registro segundos reales (millis()) desde su propio ultimo ACK
+//           de resync, decide INC/DEC/NOTOCAR (con deadband) y lo devuelve
+//           junto con su fino/segundero actual (correccion de fase). ACK:
+//           7 bytes.
+//
+// Parsing con resincronizacion byte a byte (a diferencia del diseño viejo,
+// que solo validaba el header/CRC recien al completar el buffer entero) --
+// un byte de mas o de menos (ruido del CH340 compartiendo UART0) ya no deja
+// el parser desalineado indefinidamente.
 // =============================================================
 
-enum class PicLinkEvent : uint8_t { NONE, NODE, HEARTBEAT };
+// -- comandos -- deben coincidir con GW2ESP_CMD_* de gw2esp.h (picg) --
+#define GW2ESP_CMD_NODE    0x01
+#define GW2ESP_CMD_RESYNC  0x02
+
+// -- ordenes -- deben coincidir con GW2ESP_ORDEN_* de gw2esp.h (picg) --
+#define GW2ESP_ORDEN_DEC      0x00
+#define GW2ESP_ORDEN_INC      0x01
+#define GW2ESP_ORDEN_NOTOCAR  0x02
+
+enum class PicLinkEvent : uint8_t {
+    NONE,          // nada nuevo este poll
+    NODE,          // se valido y ACKeo un frame de nodo -- readings[addr-1] ya actualizado
+    ROUND_CLOSED   // se valido y ACKeo el resync -- readings[] ya tiene el blanqueo de
+                   // UTAs ausentes aplicado (ver tocadoEstaRonda en el .cpp). Este es el
+                   // punto correcto para disparar el redibujo completo de pantalla, no
+                   // en cada NODE (mismo criterio ya usado en el proyecto: actualizar
+                   // dato es barato, redibujar es caro).
+};
 
 void picLink_init();
 
-// Llamar en cada vuelta de loop(). Si el resultado es NODE, ya actualizo
-// readings[addr-1] (el nodo que llego). Si es HEARTBEAT, readings[] NO se
-// toca aca -- es responsabilidad del llamador pasarlo a la UI y despues
-// resetearlo a sentinels para la ronda que arranca (para que un nodo
-// ausente en la ronda nueva no arrastre el dato de la anterior). gatewayId/
-// gatewayAddr se actualizan en cualquiera de los dos casos. Un frame
-// invalido (CRC no matchea, etc.) se descarta en silencio (NONE).
-PicLinkEvent picLink_poll(NodeReading readings[NUM_NODES], uint8_t *gatewayId, uint8_t *gatewayAddr);
+// Llamar en cada vuelta de loop(), con fino/segundero YA actualizados
+// (avanzarReloj() antes de esta llamada) -- si el poll valida un frame de
+// resync, el ACK sale con esa hora en el mismo llamado, sin round-trip
+// extra de latencia.
+PicLinkEvent picLink_poll(NodeReading readings[NUM_NODES], uint8_t fino, uint8_t segundero);
 
-// Arma y transmite el ACK ESP32->gateway (8 bytes) con la hora "real" del
-// ESP32 (fraccion 0..99 dentro del segundo, segundero 0..59, minuto 0..1439
-// del dia) -- llamar solo cuando picLink_poll() devuelve HEARTBEAT, para
-// que el PIC pueda resincronizarse (gw2esp_waitAck() del lado PIC).
-void picLink_sendAck(uint8_t fraccion, uint8_t segundero, uint16_t minuto);
+// -- contadores de debugging (barra de estado, sin Monitor Serie en banco) --
+uint32_t picLink_framesOk();
+uint32_t picLink_discardTimeout();   // gap entre bytes o racha cortada a mitad de frame
+uint32_t picLink_discardHeader();    // header/cmd/footer no matchea (frame corrido)
+uint32_t picLink_discardCrc();       // CRC16 (nodo) o checksum XOR (resync) invalido
 
-// contadores acumulados de debugging -- pensados para mostrar en el display
-// cuando no hay Monitor Serie disponible (USB desconectado en banco).
-uint32_t picLink_bytesTotal();       // total de bytes recibidos (si queda en 0,
-                                      // es cableado/baudrate, no framing/CRC)
-uint32_t picLink_framesOk();         // frames validados OK (nodos + latidos)
-uint32_t picLink_discardTimeout();   // se corto la racha antes de completar el frame
-uint32_t picLink_discardHeader();    // se completo el frame pero header/footer no matchea
-uint32_t picLink_discardCrc();       // header/footer ok pero CRC no matchea
-
-// tiempo (ms) entre los dos ultimos LATIDOS validados OK -- 0 hasta que haya
-// al menos 2 (~60s esperado, 1 latido por ronda). No se mide entre cada
-// frame de nodo individual (esos son mas frecuentes, ~1/seg) -- se sigue
-// midiendo entre rondas para el mismo diagnostico de desincronizacion.
-uint32_t picLink_frameIntervalMs();
-
-// tamaño del frame crudo (18 bytes) -- constante, pero expuesta para no
-// duplicar el numero mas alla de este header
-size_t picLink_rawFrameSize();
-
-// numero de secuencia: se incrementa cada vez que se completa un intento
-// de frame, se valide bien o no. Sirve para detectar "hay un dump
-// nuevo para mostrar" sin necesitar comparar el contenido.
-uint32_t picLink_captureSeq();
-
-// copia el ultimo intento de frame completo a out, sea cual sea el
-// resultado de su validacion. false si todavia no se completo ninguno.
-// Pensado para debugging visual (volcado hex en el display).
-bool picLink_getLastRawFrame(uint8_t *out, size_t outSize);
-
-// cuantos bytes lleva acumulados el intento de frame actual --
-// para ver en tiempo real si esta entrando algo, sin esperar a que se
-// complete (o se corte) un frame entero.
-size_t picLink_currentBufLen();
+// offset firmado (ms) del ultimo resync: (tiempo real medido por el ESP32) -
+// (tiempo que el picg cree que paso, segun su propio elapsed). Positivo =
+// el picg corrio lento. INT32_MIN si el ultimo resync no fue confiable
+// (sentinel) o todavia no hubo ninguno.
+int32_t picLink_offsetMs();

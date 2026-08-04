@@ -13,24 +13,22 @@
 // convencion: minimo representable del tipo, fuera de cualquier
 // rango fisico real de estos campos
 #define SENTINEL_INT8    ((int8_t)0x80)   // -128
-#define SENTINEL_UINT16  ((uint16_t)0xFFFF) // fuera de rango real del crudo (10-90% de
-                                            // fondo de escala) -- para presionRaw16
-#define SENTINEL_FINO    ((uint8_t)0xFF)  // fuera de rango valido 0-99
-#define SENTINEL_SEG     ((uint8_t)0xFF)  // fuera de rango valido 0-59
-#define SENTINEL_MINUTO  ((uint16_t)0xFFFF) // fuera de rango valido 0-1439
+#define SENTINEL_INT16   ((int16_t)0x8000) // -32768, fuera de +-9999 (rango real
+                                            // clampeado de presionMmH2O)
 
-// -- lectura de un nodo, tal como llega en el frame agregado PIC->ESP32 --
+// -- lectura de un nodo, tal como llega relayada del picg (ver PicLink.cpp) --
+// 2026-07-31: sin fino/segundero/minutero -- el nodo ya no manda su propio
+// reloj en el uplink (ver nota grande en ra01.h del lado picg: se disciplina
+// via el ACK, y el timestamp autoritativo del dato lo pone GAS al recibir,
+// no el nodo). valid() paso a usar presionMmH2O como gate.
 struct NodeReading {
-    uint16_t presionRaw16;  // TEMPORAL: crudo del ABP2 (raw24>>8), sin convertir a
-                            // mmH2O -- diagnostico de sincronizacion, mismo formato
-                            // que el wire, sin escalar (ver PicLink.cpp)
+    int16_t  presionMmH2O;  // centesimas de mmH2O, con signo (ej. 1234 = +12,34mm) --
+                            // clampeado a +-9999 en el nodo (rango real +-101,6mm,
+                            // ver abp2_convertPressure() del lado picg)
     int8_t   tempC;         // temperatura del sensor ABP2 (compensada), no del PIC
     int8_t   vbat;          // decimas de volt (ej. 23 = 2,3V) -- rango util ~18-33 para 2xAA (1,8-3,3V)
-    uint8_t  fino;          // 0-99, posicion fina dentro del segundo (~10ms) -- hora real de la foto al sensor
-    uint8_t  segundero;     // 0-59
-    uint16_t minutero;      // 0-1439, minuto del dia -- hora real de la foto al sensor
 
     bool valid() const {
-        return fino != SENTINEL_FINO && minutero != SENTINEL_MINUTO;
+        return presionMmH2O != SENTINEL_INT16;
     }
 };

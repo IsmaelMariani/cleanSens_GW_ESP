@@ -29,32 +29,23 @@ public:
 
     // contadores de debugging de PicLink -- se muestran en la barra de
     // estado; pensado para cuando no hay Monitor Serie (USB desconectado
-    // en banco). discardHeader/discardCrc nunca se vieron en banco (siempre
-    // en 0) -- sacados de la barra de estado, quedan solo en el volcado hex
-    // (drawHexDump) por si hace falta ese detalle mas adelante.
-    // frameIntervalMs: tiempo entre los 2 ultimos frames OK -- para ver si
-    // el ciclo del gateway (~60s esperados) se esta desincronizando.
-    void setDebugCounters(uint32_t framesOk, uint32_t discardTimeout,
-                          uint32_t frameIntervalMs);
-
-    // volcado hex de un buffer crudo, pantalla completa -- debugging directo
-    // del buffer de RX de la UART, bypassea tabla/grafico por completo.
-    // currentBufLen: cuanto lleva acumulado el intento de frame EN CURSO
-    // (0..186, independiente de si data/len son de un frame ya completo) --
-    // para ver en tiempo real si esta entrando algo, sin esperar a que se
-    // complete o se corte un frame entero.
-    void drawHexDump(const uint8_t *data, size_t len, size_t currentBufLen,
-                      uint32_t bytesTotal, uint32_t framesOk,
-                      uint32_t discardTimeout, uint32_t discardHeader, uint32_t discardCrc);
-
-    // TEMPORAL: debug crudo de timing (ver .ino, DEBUG_TIMING_ONLY) -- dibuja
-    // UN renglon por llamada, apenas llega cada 0xAA (nada de esperar a
-    // acumular un lote). "row" es el renglon de pantalla (wrap circular a
-    // cargo del .ino): row==0 limpia la pantalla antes de dibujar, para
-    // arrancar el ciclo siguiente.
-    void drawTimingLine(uint8_t row, uint32_t deltaMs);
+    // en banco). discardHeader/discardCrc reemplazan al viejo discardTimeout
+    // unico (2026-07-31) -- separan "frame corrido" (header/cmd/footer no
+    // matchea) de "frame alineado pero con bit corrupto" (CRC/checksum
+    // invalido), necesario para confirmar/descartar la hipotesis del CH340.
+    // offsetMs: (tiempo real medido por el ESP32) - (tiempo que el picg cree
+    // que paso, segun su propio resync) -- deberia converger a ~0 con la
+    // correccion de OSCTUNE. INT32_MIN si el ultimo resync no fue confiable
+    // o todavia no hubo ninguno.
+    void setDebugCounters(uint32_t framesOk, uint32_t discardHeader,
+                          uint32_t discardCrc, int32_t offsetMs);
 
     bool isOn() const { return _displayOn; }
+
+    // maximo tiempo de redibujo observado (ms) -- cualquier draw call que
+    // pase por update() (tabla completa, filas sueltas o grafico), medido
+    // con millis(). Sirve para saber cuanto puede llegar a bloquear loop().
+    uint32_t maxRedrawMs() const { return _maxRedrawMs; }
 
 private:
     TFT_eSPI     _tft;
@@ -69,12 +60,20 @@ private:
     NodeReading  _readings[NUM_NODES];
     uint8_t      _day, _month, _year, _hour, _minute, _second;
     uint16_t     _queueCount;
-    uint32_t     _dbgFramesOk, _dbgDiscardTimeout, _dbgFrameIntervalMs;
+    uint32_t     _dbgFramesOk, _dbgDiscardHeader, _dbgDiscardCrc;
+    int32_t      _dbgOffsetMs;
+    uint32_t     _maxRedrawMs;
 
-    // dirty flags -- evitan redibujar todo cada 1s (causaba parpadeo)
+    // dirty flags -- en MODE_TABLA hay dos niveles de redibujo (ver update()):
+    // _statusDirty dispara SOLO la franja de arriba (1x/seg tipico, el
+    // segundero tickea seguido via setClock()); _needFullRedraw/_dataDirty
+    // disparan la pantalla completa (wake/cambio de modo, o datos de nodos
+    // nuevos -- ~1x/min, cuando llega el frame agregado). _rowDirty se sigue
+    // usando en MODE_GRAFICO para saber si el nodo que se esta viendo cambio.
     bool    _needFullRedraw;         // cambio de modo/nodo/wake -> redibujar todo
-    bool    _statusDirty;            // fecha/hora/cola cambiaron -> solo la franja de arriba
-    bool    _rowDirty[NUM_NODES];    // por nodo -- solo repinta la fila que realmente cambio
+    bool    _statusDirty;            // fecha/hora/cola cambiaron -> redibuja solo la franja de arriba
+    bool    _dataDirty;              // cualquier lectura de nodo cambio -> redibuja la tabla completa
+    bool    _rowDirty[NUM_NODES];    // por nodo -- usado en MODE_GRAFICO para el nodo seleccionado
 
     void    _turnOn();
     void    _turnOff();
@@ -82,8 +81,7 @@ private:
 
     void    _drawTablaFull();
     void    _drawStatusBar();
-    void    _drawRows();        // todas -- solo en el redibujo completo
-    void    _drawDirtyRows();   // solo las marcadas en _rowDirty
+    void    _drawRows();        // todas -- unico camino de dibujo de filas ahora
     void    _drawRow(uint8_t i);
     void    _drawGrafico();
     void    _drawThickLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1,

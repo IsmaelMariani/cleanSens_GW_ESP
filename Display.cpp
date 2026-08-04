@@ -2,16 +2,14 @@
 #include "gateway_pinout.h"
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
 
 // =============================================================
 // Display.cpp
 // =============================================================
 
-// TEMPORAL: sin uso mientras se muestra el crudo en hex (ver nota en
-// SharedTypes.h/ra01.h) -- queda para cuando se vuelva a convertir a mmH2O.
 // Formatea siempre con signo explicito ("+12,34" / "-5,00"), nunca solo "-"
 // implicito del %d para los negativos y nada para los positivos.
-static void formatSignedHundredths(int16_t hundredths, char *out, size_t outSize, const char *suffix) __attribute__((unused));
 static void formatSignedHundredths(int16_t hundredths, char *out, size_t outSize, const char *suffix) {
     char    sign  = (hundredths < 0) ? '-' : '+';
     int16_t whole = abs(hundredths);
@@ -59,32 +57,34 @@ void DisplayManager::init() {
     _lastTouchMs    = 0;
     _selectedNode   = 0;
     _queueCount     = 0;
-    _dbgFramesOk = _dbgDiscardTimeout = _dbgFrameIntervalMs = 0;
+    _dbgFramesOk = _dbgDiscardHeader = _dbgDiscardCrc = 0;
+    _dbgOffsetMs = INT32_MIN;   // "todavia sin dato" -- mismo sentinel que picLink_offsetMs()
+    _maxRedrawMs = 0;
     _day = _month = _year = _hour = _minute = _second = 0;
     _needFullRedraw = false;
     _statusDirty    = false;
+    _dataDirty      = false;
     memset(_rowDirty, 0, sizeof(_rowDirty));
 
     // arranca en sentinel ("sin dato"), no en ceros crudos -- 0 es un valor
     // valido en presion/temp/vbat, memset(0) haria que valid() diera true
     // con datos falsos hasta que llegue el primer frame real
     for (uint8_t i = 0; i < NUM_NODES; i++) {
-        _readings[i].presionRaw16 = SENTINEL_UINT16;
+        _readings[i].presionMmH2O = SENTINEL_INT16;
         _readings[i].tempC        = SENTINEL_INT8;
         _readings[i].vbat         = SENTINEL_INT8;
-        _readings[i].fino         = SENTINEL_FINO;
-        _readings[i].segundero    = SENTINEL_SEG;
-        _readings[i].minutero     = SENTINEL_MINUTO;
     }
 }
 
 void DisplayManager::setReadings(const NodeReading readings[NUM_NODES]) {
-    // dirty por nodo -- si cambia un solo nodo, solo esa fila se repinta,
-    // no las 15 (evita el parpadeo de la tabla completa)
+    // _rowDirty por nodo se sigue marcando (lo usa MODE_GRAFICO para saber
+    // si el nodo que se esta viendo cambio); _dataDirty es el disparador
+    // simple para MODE_TABLA, que siempre redibuja completo si cambio algo.
     for (uint8_t i = 0; i < NUM_NODES; i++) {
         if (memcmp(&_readings[i], &readings[i], sizeof(NodeReading)) != 0) {
             _readings[i] = readings[i];
             _rowDirty[i] = true;
+            _dataDirty   = true;
         }
     }
 }
@@ -106,13 +106,14 @@ void DisplayManager::setQueueCount(uint16_t count) {
     }
 }
 
-void DisplayManager::setDebugCounters(uint32_t framesOk, uint32_t discardTimeout,
-                                       uint32_t frameIntervalMs) {
-    if (_dbgFramesOk != framesOk || _dbgDiscardTimeout != discardTimeout ||
-        _dbgFrameIntervalMs != frameIntervalMs) {
-        _dbgFramesOk        = framesOk;
-        _dbgDiscardTimeout  = discardTimeout;
-        _dbgFrameIntervalMs = frameIntervalMs;
+void DisplayManager::setDebugCounters(uint32_t framesOk, uint32_t discardHeader,
+                                       uint32_t discardCrc, int32_t offsetMs) {
+    if (_dbgFramesOk != framesOk || _dbgDiscardHeader != discardHeader ||
+        _dbgDiscardCrc != discardCrc || _dbgOffsetMs != offsetMs) {
+        _dbgFramesOk      = framesOk;
+        _dbgDiscardHeader = discardHeader;
+        _dbgDiscardCrc    = discardCrc;
+        _dbgOffsetMs      = offsetMs;
         _statusDirty = true;
     }
 }
@@ -164,25 +165,55 @@ void DisplayManager::update() {
         return;
     }
 
-    // redibujo dirigido por cambios reales, no por un timer parejo --
-    // evita el parpadeo de limpiar toda la pantalla o toda la tabla
+    // redibujo dirigido por cambios reales, no por un timer parejo -- solo
+    // redibuja si de verdad hay algo nuevo (touch, frame o status). En
+    // MODE_TABLA hay dos niveles (2026-07-29, a pedido del usuario): el
+    // renglon de estado (fecha/hora/contadores) se redibuja solo el, cada vez
+    // que cambia -- en la practica 1x/seg, porque el segundero tickea seguido
+    // via setClock(). La pantalla completa (con las 15 filas) solo se
+    // redibuja cuando cambian datos de nodos (_dataDirty, ~1x/min, cuando
+    // llega el frame agregado) o hay wake/cambio de modo (_needFullRedraw) --
+    // asi el titileo de pantalla completa queda a esa cadencia de un minuto,
+    // no de un segundo. Cada rama que efectivamente dibuja se mide con
+    // millis() y actualiza _maxRedrawMs -- el peor caso observado en banco
+    // (loop() queda bloqueado ese tiempo, asi que es el numero que importa
+    // para saber si compite con algo mas, ej. el handoff de datos al nucleo
+    // de WiFi).
+    unsigned long t0 = millis();
+    bool didDraw = true;
+
     if (_mode == MODE_TABLA) {
-        if (_needFullRedraw) {
-            _drawTablaFull();
+        if (_needFullRedraw || _dataDirty) {
+            _drawTablaFull();   // ya incluye _drawStatusBar() adentro
             _needFullRedraw = false;
-            _statusDirty = false;
+            _statusDirty    = false;
+            _dataDirty      = false;
             memset(_rowDirty, 0, sizeof(_rowDirty));
+        } else if (_statusDirty) {
+            _drawStatusBar();
+            _statusDirty = false;
         } else {
-            if (_statusDirty) { _drawStatusBar(); _statusDirty = false; }
-            _drawDirtyRows();   // solo repinta las filas que realmente cambiaron
+            didDraw = false;
         }
     } else {   // MODE_GRAFICO
         bool selectedDirty = _rowDirty[_selectedNode];
         if (_needFullRedraw || selectedDirty) {
             _drawGrafico();
             _needFullRedraw = false;
+        } else {
+            didDraw = false;
         }
-        memset(_rowDirty, 0, sizeof(_rowDirty));   // se consumen igual, aunque no esten a la vista
+        // se consumen igual aunque no esten a la vista -- no hace falta
+        // acarrearlos: el cambio de modo de vuelta a TABLA ya fuerza
+        // _needFullRedraw=true (ver timeout mas arriba), asi que la tabla
+        // sale al dia sin depender de estos flags.
+        memset(_rowDirty, 0, sizeof(_rowDirty));
+        _dataDirty = false;
+    }
+
+    if (didDraw) {
+        uint32_t dt = (uint32_t)(millis() - t0);
+        if (dt > _maxRedrawMs) _maxRedrawMs = dt;
     }
 }
 
@@ -220,23 +251,34 @@ void DisplayManager::_drawTablaFull() {
 void DisplayManager::_drawStatusBar() {
     _tft.fillRect(0, 0, 240, STATUS_H - 1, TFT_BLACK);
 
-    // fecha temporalmente fuera (fija/ficticia, no aporta hoy) para hacer
-    // lugar a los contadores O/I y al intervalo entre frames -- mismo
-    // criterio ya usado el 21/7 con los contadores de debug anteriores
-    // (R/T/H/K). E (discardHeader+discardCrc) sacado: nunca se vio un solo
-    // caso en banco, todo el descarte observado es I (discardTimeout).
-    char line[56];
-    if (_dbgFrameIntervalMs == 0) {
-        snprintf(line, sizeof(line), "%02d:%02d:%02d  Cola:%u  O:%lu I:%lu  dt:--",
+    // 2026-07-31: fecha sacada (DD/MM) para correr todo a la izquierda -- a
+    // pedido del usuario, "o:" (offset) quedaba cortado en el borde de los
+    // 240px con la fecha adelante. Fecha simulada igual (sin NTP todavia,
+    // ver simDay/simMonth en el .ino), no aportaba nada util en banco.
+    // I (discardTimeout unico) reemplazado por H (header/cmd/footer no
+    // matchea, frame corrido) y K (CRC/checksum invalido, frame alineado
+    // pero con bit corrupto) -- separarlos es justo lo que hace falta para
+    // confirmar/descartar la hipotesis del CH340 (nivel logico bajo en ~1V
+    // en vez de 0V -- corrupcion de bit, no framing).
+    // off: offset firmado contra el elapsed que reporta el propio picg (ver
+    // picLink_offsetMs()) -- deberia converger a ~0 con la correccion de
+    // OSCTUNE. r: maximo tiempo de redibujo medido con millis() (_maxRedrawMs).
+    char line[88];
+    if (_dbgOffsetMs == INT32_MIN) {
+        snprintf(line, sizeof(line), "%02d:%02d:%02d C:%u O:%lu H:%lu K:%lu o:-- r:%lums",
                  _hour, _minute, _second, _queueCount,
                  (unsigned long)_dbgFramesOk,
-                 (unsigned long)_dbgDiscardTimeout);
+                 (unsigned long)_dbgDiscardHeader,
+                 (unsigned long)_dbgDiscardCrc,
+                 (unsigned long)_maxRedrawMs);
     } else {
-        snprintf(line, sizeof(line), "%02d:%02d:%02d  Cola:%u  O:%lu I:%lu  dt:%lums",
+        snprintf(line, sizeof(line), "%02d:%02d:%02d C:%u O:%lu H:%lu K:%lu o:%+ldms r:%lums",
                  _hour, _minute, _second, _queueCount,
                  (unsigned long)_dbgFramesOk,
-                 (unsigned long)_dbgDiscardTimeout,
-                 (unsigned long)_dbgFrameIntervalMs);
+                 (unsigned long)_dbgDiscardHeader,
+                 (unsigned long)_dbgDiscardCrc,
+                 (long)_dbgOffsetMs,
+                 (unsigned long)_maxRedrawMs);
     }
     _tft.setTextColor(TFT_WHITE, TFT_BLACK);
     _tft.drawString(line, 4, 3, 2);
@@ -269,7 +311,7 @@ void DisplayManager::_drawRow(uint8_t i) {
         uint16_t dimColor = _tft.color565(120, 120, 120);
         _tft.setTextColor(dimColor, TFT_BLACK);
 
-        const char *presionStr = "----";   // TEMPORAL: mismo ancho que el hex de 4 digitos
+        const char *presionStr = "--,--mm";   // mismo ancho/forma que un valor real con signo
         int16_t presionW = _tft.textWidth(presionStr, 2);
         int16_t presionX = presionLeft + (presionRight - presionLeft - presionW) / 2;
         _tft.drawString(presionStr, presionX, y + 2, 2);
@@ -285,7 +327,7 @@ void DisplayManager::_drawRow(uint8_t i) {
         _tft.drawString("--,-V", COL_VBAT_X, y + 2, 2);
     } else {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%04X", r.presionRaw16);   // TEMPORAL: crudo en hex, ver SharedTypes.h
+        formatSignedHundredths(r.presionMmH2O, buf, sizeof(buf), "mm");
         _tft.setTextColor(TFT_WHITE, TFT_BLACK);
         int16_t presionW = _tft.textWidth(buf, 2);
         int16_t presionX = presionLeft + (presionRight - presionLeft - presionW) / 2;
@@ -312,69 +354,6 @@ void DisplayManager::_drawRows() {
     for (uint8_t i = 0; i < NUM_NODES; i++) _drawRow(i);
 }
 
-// -------------------------------------------------------------
-// _drawDirtyRows -- solo repinta las filas marcadas, y limpia el flag
-// -------------------------------------------------------------
-void DisplayManager::_drawDirtyRows() {
-    for (uint8_t i = 0; i < NUM_NODES; i++) {
-        if (_rowDirty[i]) {
-            _drawRow(i);
-            _rowDirty[i] = false;
-        }
-    }
-}
-
-// -------------------------------------------------------------
-// drawTimingLine -- TEMPORAL, ver .ino DEBUG_TIMING_ONLY. Bypassea
-// tabla/grafico/touch por completo, igual que drawHexDump. Dibuja un solo
-// renglon apenas llega cada 0xAA -- row==0 limpia la pantalla primero
-// (arranque de un ciclo nuevo tras el wrap circular que maneja el .ino).
-// -------------------------------------------------------------
-void DisplayManager::drawTimingLine(uint8_t row, uint32_t deltaMs) {
-    if (row == 0) _tft.fillScreen(TFT_BLACK);
-    _tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    char line[24];
-    snprintf(line, sizeof(line), "%2d: %lu ms", row + 1, (unsigned long)deltaMs);
-    _tft.drawString(line, 4, row * ROW_H + 4, 2);
-}
-
-// -------------------------------------------------------------
-// drawHexDump -- volcado hex de un buffer crudo, pantalla completa.
-// Debugging directo: bypassea tabla/grafico/touch por completo, no toca
-// ningun dirty-flag -- se llama directo desde el .ino cuando PicLink
-// captura un frame nuevo (se valide bien o no).
-// -------------------------------------------------------------
-void DisplayManager::drawHexDump(const uint8_t *data, size_t len, size_t currentBufLen,
-                                  uint32_t bytesTotal, uint32_t framesOk,
-                                  uint32_t discardTimeout, uint32_t discardHeader,
-                                  uint32_t discardCrc) {
-    if (!_displayOn) _turnOn();
-
-    _tft.fillScreen(TFT_BLACK);
-    _tft.setTextColor(TFT_WHITE, TFT_BLACK);
-
-    char line[56];
-    snprintf(line, sizeof(line), "bytes:%lu ok:%lu buf:%u/186",
-             (unsigned long)bytesTotal, (unsigned long)framesOk, (unsigned)currentBufLen);
-    _tft.drawString(line, 4, 2, 1);
-    snprintf(line, sizeof(line), "T:%lu H:%lu K:%lu len:%u",
-             (unsigned long)discardTimeout, (unsigned long)discardHeader,
-             (unsigned long)discardCrc, (unsigned)len);
-    _tft.drawString(line, 4, 14, 1);
-
-    const uint8_t BYTES_PER_ROW = 12;
-    int16_t y = 28;
-    for (size_t i = 0; i < len; i += BYTES_PER_ROW) {
-        char hexline[56];
-        int  pos = snprintf(hexline, sizeof(hexline), "%03u:", (unsigned)i);
-        for (size_t j = i; j < i + BYTES_PER_ROW && j < len; j++) {
-            pos += snprintf(hexline + pos, sizeof(hexline) - (size_t)pos, " %02X", data[j]);
-        }
-        _tft.drawString(hexline, 2, y, 1);
-        y += 11;
-        if (y > 316) break;   // no seguir escribiendo fuera de pantalla
-    }
-}
 
 // -------------------------------------------------------------
 // _drawGrafico -- tubo inclinado tipo Dwyer, un nodo a pantalla completa
@@ -426,10 +405,14 @@ void DisplayManager::_drawGrafico() {
         _tft.drawString(vStr, x, y, FONT);
     }
 
-    // TEMPORAL: r.presionRaw16 es el crudo del sensor (sin convertir, sin signo)
-    // -- no hay mas concepto de dP invertida/alarma con este dato. frac usa el
-    // rango completo de uint16 solo para tener una barra que se mueva.
-    float frac = (float)r.presionRaw16 / 65535.0f;
+    // r.presionMmH2O ya viene en centesimas de mmH2O, con signo -- frac mapea
+    // el rango +-SENSOR_RANGE_MM (0 = vacio, extremo negativo; 1 = lleno,
+    // extremo positivo; 0,5 = 0mm, sin diferencial), clampeado por si el
+    // clamp del nodo (+-9999) quedara apenas afuera de SENSOR_RANGE_MM*100.
+    const float rangeCenti = (float)SENSOR_RANGE_MM * 100.0f;
+    float frac = ((float)r.presionMmH2O + rangeCenti) / (2.0f * rangeCenti);
+    if (frac < 0.0f) frac = 0.0f;
+    else if (frac > 1.0f) frac = 1.0f;
 
     uint16_t emptyColor = _tft.color565(90, 90, 90);
     uint16_t fillColor  = _tft.color565(200, 15, 15);
@@ -448,7 +431,7 @@ void DisplayManager::_drawGrafico() {
     _drawThickLine(TUBE_X0, TUBE_Y0, lx, ly, TUBE_HALFW, fillColor);
 
     char val[16];
-    snprintf(val, sizeof(val), "%04X", r.presionRaw16);   // TEMPORAL: crudo en hex
+    formatSignedHundredths(r.presionMmH2O, val, sizeof(val), " mmH2O");
     _tft.setTextColor(TFT_WHITE, TFT_BLACK);
     _tft.drawCentreString(val, 120, 300, 4);
 }
