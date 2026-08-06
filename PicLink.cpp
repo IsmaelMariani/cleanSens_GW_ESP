@@ -75,12 +75,14 @@ static void convertNode(const NodeRecordWire &w, NodeReading &r) {
     r.presionMmH2O = w.presionMmH2O;   // ya en centesimas de mmH2O, el nodo lo manda convertido
     r.tempC        = w.tempC;          // ya en grados C, el nodo lo manda convertido
     r.vbat         = w.vbat;           // ya en decimas de volt, el nodo lo manda convertido
+    r.idNodo       = w.id;
 }
 
 static void blankReading(NodeReading &r) {
     r.presionMmH2O = SENTINEL_INT16;
     r.tempC        = SENTINEL_INT8;
     r.vbat         = SENTINEL_INT8;
+    r.idNodo       = SENTINEL_ID;
 }
 
 void picLink_init() {
@@ -134,9 +136,6 @@ static PicLinkEvent handleFrame(NodeReading readings[NUM_NODES], uint8_t fino, u
         // queda cubierto por el sentinel de elapsed, ver PicLink.h/gw2esp.h).
 
         unsigned long nowMs = millis();
-        // deltaEspMs calculado SIEMPRE (no solo en la rama con orden real) --
-        // hace falta para el debug crudo de abajo (UTA3/UTA4) aunque este
-        // resync en particular haya venido con el sentinel.
         long deltaEspMs = g_haveLastAck ? (long)(nowMs - g_lastAckMs) : -1;
 
         uint8_t orden;
@@ -178,26 +177,6 @@ static PicLinkEvent handleFrame(NodeReading readings[NUM_NODES], uint8_t fino, u
             if (!tocadoEstaRonda[i]) blankReading(readings[i]);
             tocadoEstaRonda[i] = false;
         }
-
-        // TEMPORAL (2026-07-31): debug crudo del resync pisando UTA3/UTA4 --
-        // mismo truco ya usado antes con lastErrorTicks en la presion del
-        // nodo real. UTA3/4 no tienen nodo fisico armado todavia, libres
-        // para esto sin pisar dato real. Se escribe DESPUES del blanqueo de
-        // arriba, si no el propio blanqueo lo pisaria en la misma vuelta.
-        // UTA3.presionMmH2O = elapsedTicks tal cual lo mando el picg (crudo,
-        // reinterpretado como int16 -- 0xFFFF=sentinel se ve como -1 acá) --
-        // confirma si el propio picg esta reportando ~6000 cada ronda o si
-        // el numero le sigue creciendo a EL tambien.
-        // UTA4.presionMmH2O = deltaEspMs/1000 (segundos enteros, para que
-        // entre en 16 bits aunque el offset seguido crezca varios minutos,
-        // -1 si todavia no hay ack previo) -- confirma si g_lastAckMs se
-        // esta actualizando de verdad cada ronda o si quedo pegado en un
-        // valor viejo (creceria ~60s por ronda).
-        readings[2].presionMmH2O = (int16_t)elapsedTicks;
-        readings[2].tempC = readings[2].vbat = 0;
-
-        readings[3].presionMmH2O = (deltaEspMs < 0) ? -1 : (int16_t)(deltaEspMs / 1000);
-        readings[3].tempC = readings[3].vbat = 0;
 
         g_framesOk++;
         return PicLinkEvent::ROUND_CLOSED;

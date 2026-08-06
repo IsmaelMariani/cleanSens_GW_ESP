@@ -20,6 +20,13 @@ static void formatSignedHundredths(int16_t hundredths, char *out, size_t outSize
 #define STATUS_H      20
 #define ROW_H         20   // (320-STATUS_H)/NUM_NODES = 300/15 = 20 exacto
 
+// -- columnas de la barra de estado -- 3 zonas independientes, cada una se
+// redibuja sola (ver _drawStatusBar()) sin tocar las otras
+#define COL_DATE_X    4
+#define COL_CLOCK_X   58
+#define COL_CLOCK_W   80
+#define COL_I_X       222
+
 // columnas de la fila -- presion tiene la columna mas ancha (queda a la
 // izquierda del divisor, centrada entre el ID y el divisor), temperatura
 // y bateria corridas a la derecha
@@ -57,12 +64,13 @@ void DisplayManager::init() {
     _lastTouchMs    = 0;
     _selectedNode   = 0;
     _queueCount     = 0;
-    _dbgFramesOk = _dbgDiscardHeader = _dbgDiscardCrc = 0;
-    _dbgOffsetMs = INT32_MIN;   // "todavia sin dato" -- mismo sentinel que picLink_offsetMs()
+    _internetOk     = false;   // sin TX intentada todavia
     _maxRedrawMs = 0;
     _day = _month = _year = _hour = _minute = _second = 0;
     _needFullRedraw = false;
-    _statusDirty    = false;
+    _dateDirty      = false;
+    _clockDirty     = false;
+    _internetDirty  = false;
     _dataDirty      = false;
     memset(_rowDirty, 0, sizeof(_rowDirty));
 
@@ -74,6 +82,25 @@ void DisplayManager::init() {
         _readings[i].tempC        = SENTINEL_INT8;
         _readings[i].vbat         = SENTINEL_INT8;
     }
+}
+
+void DisplayManager::showBootMessage(const char *msg) {
+    digitalWrite(PIN_TFT_BL, HIGH);
+    _tft.fillScreen(TFT_BLACK);
+
+    _tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    _tft.drawCentreString("CleanSens", 120, 125, 4);
+    _tft.drawFastHLine(60, 155, 120, _tft.color565(60, 60, 60));
+
+    _tft.setTextColor(_tft.color565(160, 160, 160), TFT_BLACK);
+    _tft.drawCentreString(msg, 120, 168, 2);
+}
+
+void DisplayManager::endBootMessage() {
+    digitalWrite(PIN_TFT_BL, LOW);
+    _tft.fillScreen(TFT_BLACK);
+    // _displayOn queda en false (default de init()) -- el criterio "apagado
+    // por defecto, on demand via touch" sigue igual despues del arranque
 }
 
 void DisplayManager::setReadings(const NodeReading readings[NUM_NODES]) {
@@ -91,30 +118,24 @@ void DisplayManager::setReadings(const NodeReading readings[NUM_NODES]) {
 
 void DisplayManager::setClock(uint8_t day, uint8_t month, uint8_t year,
                                uint8_t hour, uint8_t minute, uint8_t second) {
-    if (_day != day || _month != month || _year != year ||
-        _hour != hour || _minute != minute || _second != second) {
+    if (_day != day || _month != month || _year != year) {
         _day = day; _month = month; _year = year;
+        _dateDirty = true;
+    }
+    if (_hour != hour || _minute != minute || _second != second) {
         _hour = hour; _minute = minute; _second = second;
-        _statusDirty = true;
+        _clockDirty = true;
     }
 }
 
 void DisplayManager::setQueueCount(uint16_t count) {
-    if (_queueCount != count) {
-        _queueCount = count;
-        _statusDirty = true;
-    }
+    _queueCount = count;   // no se muestra en pantalla hoy (2026-08-05) -- sin dirty flag propio
 }
 
-void DisplayManager::setDebugCounters(uint32_t framesOk, uint32_t discardHeader,
-                                       uint32_t discardCrc, int32_t offsetMs) {
-    if (_dbgFramesOk != framesOk || _dbgDiscardHeader != discardHeader ||
-        _dbgDiscardCrc != discardCrc || _dbgOffsetMs != offsetMs) {
-        _dbgFramesOk      = framesOk;
-        _dbgDiscardHeader = discardHeader;
-        _dbgDiscardCrc    = discardCrc;
-        _dbgOffsetMs      = offsetMs;
-        _statusDirty = true;
+void DisplayManager::setInternetOk(bool ok) {
+    if (_internetOk != ok) {
+        _internetOk    = ok;
+        _internetDirty = true;
     }
 }
 
@@ -167,31 +188,29 @@ void DisplayManager::update() {
 
     // redibujo dirigido por cambios reales, no por un timer parejo -- solo
     // redibuja si de verdad hay algo nuevo (touch, frame o status). En
-    // MODE_TABLA hay dos niveles (2026-07-29, a pedido del usuario): el
-    // renglon de estado (fecha/hora/contadores) se redibuja solo el, cada vez
-    // que cambia -- en la practica 1x/seg, porque el segundero tickea seguido
-    // via setClock(). La pantalla completa (con las 15 filas) solo se
-    // redibuja cuando cambian datos de nodos (_dataDirty, ~1x/min, cuando
-    // llega el frame agregado) o hay wake/cambio de modo (_needFullRedraw) --
-    // asi el titileo de pantalla completa queda a esa cadencia de un minuto,
-    // no de un segundo. Cada rama que efectivamente dibuja se mide con
-    // millis() y actualiza _maxRedrawMs -- el peor caso observado en banco
-    // (loop() queda bloqueado ese tiempo, asi que es el numero que importa
-    // para saber si compite con algo mas, ej. el handoff de datos al nucleo
-    // de WiFi).
+    // MODE_TABLA hay dos niveles: la franja de arriba se redibuja sola
+    // (_drawStatusBar(), 2026-08-05: partida en 3 zonas independientes --
+    // fecha/hora/"I" -- cada una repinta solo su propio rectangulo, ver
+    // adentro de _drawStatusBar()). La pantalla completa (con las 15 filas)
+    // solo se redibuja cuando cambian datos de nodos (_dataDirty, ~1x/min,
+    // cuando llega el frame agregado) o hay wake/cambio de modo
+    // (_needFullRedraw) -- asi el titileo de pantalla completa queda a esa
+    // cadencia de un minuto, no de un segundo. Cada rama que efectivamente
+    // dibuja se mide con millis() y actualiza _maxRedrawMs -- el peor caso
+    // observado en banco (loop() queda bloqueado ese tiempo, asi que es el
+    // numero que importa para saber si compite con algo mas, ej. el
+    // handoff de datos al nucleo de WiFi).
     unsigned long t0 = millis();
     bool didDraw = true;
 
     if (_mode == MODE_TABLA) {
         if (_needFullRedraw || _dataDirty) {
-            _drawTablaFull();   // ya incluye _drawStatusBar() adentro
+            _drawTablaFull();   // ya incluye _drawStatusBar() adentro (fuerza las 3 zonas, ver ahi)
             _needFullRedraw = false;
-            _statusDirty    = false;
             _dataDirty      = false;
             memset(_rowDirty, 0, sizeof(_rowDirty));
-        } else if (_statusDirty) {
-            _drawStatusBar();
-            _statusDirty = false;
+        } else if (_dateDirty || _clockDirty || _internetDirty) {
+            _drawStatusBar();   // redibuja solo las zonas que cambiaron, limpia sus propios flags
         } else {
             didDraw = false;
         }
@@ -241,47 +260,45 @@ int8_t DisplayManager::_hitTestRow(int16_t y) const {
 // -------------------------------------------------------------
 void DisplayManager::_drawTablaFull() {
     _tft.fillScreen(TFT_BLACK);
+    // fillScreen borro las 3 zonas de la barra de estado -- forzar que
+    // _drawStatusBar() las repinte todas, sin importar si habian cambiado
+    // de verdad (si no, quedarian en negro/invisibles tras el fillScreen)
+    _dateDirty = _clockDirty = _internetDirty = true;
     _drawStatusBar();
     _drawRows();
 }
 
 // -------------------------------------------------------------
-// _drawStatusBar -- solo la franja de arriba (fecha/hora/cola), 1x/seg
+// _drawStatusBar -- franja de arriba, 3 zonas independientes (fecha/hora/
+// "I"), cada una repinta SOLO su propio rectangulo -- evita repintar (y
+// titilar) partes que no cambiaron.
 // -------------------------------------------------------------
 void DisplayManager::_drawStatusBar() {
-    _tft.fillRect(0, 0, 240, STATUS_H - 1, TFT_BLACK);
-
-    // 2026-07-31: fecha sacada (DD/MM) para correr todo a la izquierda -- a
-    // pedido del usuario, "o:" (offset) quedaba cortado en el borde de los
-    // 240px con la fecha adelante. Fecha simulada igual (sin NTP todavia,
-    // ver simDay/simMonth en el .ino), no aportaba nada util en banco.
-    // I (discardTimeout unico) reemplazado por H (header/cmd/footer no
-    // matchea, frame corrido) y K (CRC/checksum invalido, frame alineado
-    // pero con bit corrupto) -- separarlos es justo lo que hace falta para
-    // confirmar/descartar la hipotesis del CH340 (nivel logico bajo en ~1V
-    // en vez de 0V -- corrupcion de bit, no framing).
-    // off: offset firmado contra el elapsed que reporta el propio picg (ver
-    // picLink_offsetMs()) -- deberia converger a ~0 con la correccion de
-    // OSCTUNE. r: maximo tiempo de redibujo medido con millis() (_maxRedrawMs).
-    char line[88];
-    if (_dbgOffsetMs == INT32_MIN) {
-        snprintf(line, sizeof(line), "%02d:%02d:%02d C:%u O:%lu H:%lu K:%lu o:-- r:%lums",
-                 _hour, _minute, _second, _queueCount,
-                 (unsigned long)_dbgFramesOk,
-                 (unsigned long)_dbgDiscardHeader,
-                 (unsigned long)_dbgDiscardCrc,
-                 (unsigned long)_maxRedrawMs);
-    } else {
-        snprintf(line, sizeof(line), "%02d:%02d:%02d C:%u O:%lu H:%lu K:%lu o:%+ldms r:%lums",
-                 _hour, _minute, _second, _queueCount,
-                 (unsigned long)_dbgFramesOk,
-                 (unsigned long)_dbgDiscardHeader,
-                 (unsigned long)_dbgDiscardCrc,
-                 (long)_dbgOffsetMs,
-                 (unsigned long)_maxRedrawMs);
+    if (_dateDirty) {
+        _tft.fillRect(COL_DATE_X, 0, COL_CLOCK_X - COL_DATE_X, STATUS_H - 1, TFT_BLACK);
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%02d/%02d", _day, _month);
+        _tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        _tft.drawString(buf, COL_DATE_X, 3, 2);
+        _dateDirty = false;
     }
-    _tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    _tft.drawString(line, 4, 3, 2);
+
+    if (_clockDirty) {
+        _tft.fillRect(COL_CLOCK_X, 0, COL_CLOCK_W, STATUS_H - 1, TFT_BLACK);
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", _hour, _minute, _second);
+        _tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        _tft.drawString(buf, COL_CLOCK_X, 3, 2);
+        _clockDirty = false;
+    }
+
+    if (_internetDirty) {
+        _tft.fillRect(COL_I_X, 0, 240 - COL_I_X, STATUS_H - 1, TFT_BLACK);
+        _tft.setTextColor(_internetOk ? TFT_GREEN : TFT_RED, TFT_BLACK);
+        _tft.drawString("I", COL_I_X, 3, 2);
+        _internetDirty = false;
+    }
+
     _tft.drawFastHLine(0, STATUS_H - 1, 240, _tft.color565(60, 60, 60));
 }
 

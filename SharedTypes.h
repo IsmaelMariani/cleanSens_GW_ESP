@@ -15,6 +15,7 @@
 #define SENTINEL_INT8    ((int8_t)0x80)   // -128
 #define SENTINEL_INT16   ((int16_t)0x8000) // -32768, fuera de +-9999 (rango real
                                             // clampeado de presionMmH2O)
+#define SENTINEL_ID      ((uint8_t)0xFF)   // 255, "sin nodo fisico asignado"
 
 // -- lectura de un nodo, tal como llega relayada del picg (ver PicLink.cpp) --
 // 2026-07-31: sin fino/segundero/minutero -- el nodo ya no manda su propio
@@ -27,6 +28,8 @@ struct NodeReading {
                             // ver abp2_convertPressure() del lado picg)
     int8_t   tempC;         // temperatura del sensor ABP2 (compensada), no del PIC
     int8_t   vbat;          // decimas de volt (ej. 23 = 2,3V) -- rango util ~18-33 para 2xAA (1,8-3,3V)
+    uint8_t  idNodo;        // id de fabrica del nodo fisico que reporto esta UTA en esta ronda
+                            // (trazabilidad UTA<->nodo, ver hoja UTA-NODO) -- SENTINEL_ID si ausente
 
     bool valid() const {
         return presionMmH2O != SENTINEL_INT16;
