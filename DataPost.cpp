@@ -29,7 +29,27 @@
 // necesita bastante mas que el default de una task chica.
 #define DATAPOST_TASK_STACK_BYTES  10240
 #define DATAPOST_TASK_CORE         0        // nunca Core 1 (loop()/picLink_poll/UART)
-#define DATAPOST_QUEUE_LEN         2        // 1 en vuelo + 1 recien encolada, alcanza de sobra a 1 TX/2min
+
+// 2026-08-06: buffer de cortes de internet -- antes 2 (1 en vuelo + 1
+// recien encolada), ahora dimensionado para no perder datos durante un
+// corte largo. 576 = 2 dias / 5min (el intervalo minimo que va a pedir el
+// cliente, ver Averager.h -- dimensionar contra el minimo es el caso
+// conservador: con un intervalo mayor, estos mismos registros cubren MAS
+// de 2 dias, nunca menos). PostItem pesa ~100 bytes -> ~58KB total, contra
+// ~280KB de heap libre medidos en banco en operacion normal (WiFi+display+
+// esta misma task activos) -- deja margen de sobra para todo lo que falta
+// implementar (sistema de alertas, etc.).
+#define DATAPOST_QUEUE_LEN         576
+
+// cada cuanto reintenta el envio mas viejo si fallo -- mismo ritmo que
+// wifiConfig_mantener() (no tiene sentido reintentar mas seguido que lo
+// que la propia capa de WiFi intenta reconectar).
+#define DATAPOST_RETRY_DELAY_MS    30000
+
+// cada cuantos fallos SEGUIDOS (con WiFi.status() diciendo "conectado") se
+// chequea conectividad real -- ver hayInternetReal()/s_forzarReconexion mas
+// abajo.
+#define DATAPOST_CONECTIVIDAD_CADA_N_FALLOS  3
 
 struct PostItem {
     NodeReading readings[NUM_NODES];
@@ -48,6 +68,38 @@ static QueueHandle_t s_queue = nullptr;
 static volatile bool     s_lastWifiOk = false;
 static volatile bool     s_lastTxOk   = false;
 static volatile uint32_t s_resultSeq  = 0;
+
+// 2026-08-07: cuantos envios se descartaron tras fallar (ver dataPostTask()
+// mas abajo) -- contador interno, sin mostrar en pantalla todavia, para
+// medir cuan seguido pasa esto antes de decidir si hace falta logica de
+// verificacion contra tipo=ultima.
+static volatile uint32_t s_perdidos = 0;
+
+// diagnostico 2026-08-06 -- code crudo + fragmento del body de la ultima
+// respuesta HTTP, mismo criterio de "unica escritora/unica lectora" que los
+// bools de arriba. code=-1 si http.begin() fallo o si no hubo intento
+// (WiFi no conectado). Se muestran en pantalla cuando la TX falla, ver
+// DisplayManager::showPostFail() / .ino.
+static volatile int s_lastHttpCode = -1;
+static char         s_lastRespSnippet[120] = {0};
+
+// 2026-08-06 -- pedido de reconexion forzada, Core0 (esta task) -> Core1
+// (wifiConfig_mantener()). Escritora: esta task, cuando WiFi.status() dice
+// "conectado" pero ni siquiera resuelve DNS (router colgado con la
+// asociacion WiFi todavia viva -- WiFi.status() no lo detecta solo).
+// Lectora+consumidora: wifiConfig_mantener(), que la pone en false apenas
+// la lee (dataPost_debeForzarReconexion()). Esta task NUNCA toca el WiFi
+// directamente -- solo pide, Core1 decide y ejecuta (ver DataPost.h).
+static volatile bool s_forzarReconexion = false;
+
+// resolucion DNS contra un host externo conocido -- liviano (no arma TLS ni
+// hace un POST completo), sirve para distinguir "WiFi asociado pero sin
+// salida real a internet" (router colgado) de "efectivamente sin WiFi"
+// (ya cubierto por wifiOk==false, camino normal de wifiConfig_mantener()).
+static bool hayInternetReal() {
+    IPAddress ip;
+    return WiFi.hostByName("www.google.com", ip);
+}
 
 static void agregarArrayInt(String &json, const char *clave,
                              const NodeReading readings[NUM_NODES],
@@ -98,24 +150,45 @@ static bool enviarInterno(const NodeReading readings[NUM_NODES], int64_t epochMe
 
     HTTPClient http;
     if (!http.begin(client, GAS_WEBAPP_URL)) return false;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GAS responde con 302 antes del resultado real
+    // default (~5000ms) insuficiente -- confirmado en banco (-11 =
+    // HTTPC_ERROR_READ_TIMEOUT): doPost() puede tardar hasta 13s en
+    // ejecutar (Log de Ejecuciones de Apps Script, 2026-08-06), y ese tiempo
+    // va antes del 302 -- 20s da margen aunque las hojas sigan creciendo.
+    http.setTimeout(20000);
+    // 2026-08-06: NO seguir el redirect. GAS siempre responde 302 (Location a
+    // script.googleusercontent.com) cuando el script termino sin excepcion no
+    // capturada -- confirmado que ese primer salto SIEMPRE llega bien (datos
+    // grabados, Log de Ejecuciones en "Completada" en todos los casos
+    // probados). El segundo salto (persiguiendo el contenido real via
+    // HTTPC_STRICT_FOLLOW_REDIRECTS) devolvia sistematicamente HTTP 400 +
+    // pagina de error HTML de Google, nunca el JSON real -- causa exacta de
+    // por que la "I" quedaba siempre roja pese a que el dato llegaba. Como
+    // los 4 arrays del firmware siempre tienen 15 elementos por construccion,
+    // el unico caso de {"ok":false} posible del lado de procesarMedicion()
+    // nunca ocurre en la practica -- code==302 es un proxy confiable de
+    // exito, sin necesidad de perseguir el contenido.
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.addHeader("Content-Type", "application/json");
 
     int code = http.POST(json);
     String respBody = http.getString();
     http.end();
 
-    if (code != 200) return false;
-    // GAS siempre responde 200 (hasta con {"ok":false,"error":...} ante un
-    // rechazo de validacion, ver procesarMedicion()) -- el codigo HTTP solo
-    // confirma que el request llego, no que el dato se haya grabado.
-    return respBody.indexOf("\"ok\":true") >= 0;
+    s_lastHttpCode = code;
+    strncpy(s_lastRespSnippet, respBody.c_str(), sizeof(s_lastRespSnippet) - 1);
+    s_lastRespSnippet[sizeof(s_lastRespSnippet) - 1] = '\0';
+
+    return code == 302;
 }
 
 static void dataPostTask(void *param) {
     PostItem item;
+    bool    havePending    = false;   // true = "item" es un envio que ya fallo antes, reintentar el MISMO
+    uint8_t fallosSeguidos = 0;
     for (;;) {
-        if (xQueueReceive(s_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        if (!havePending) {
+            if (xQueueReceive(s_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        }
 
         bool wifiOk = (WiFi.status() == WL_CONNECTED);
         bool txOk   = wifiOk ? enviarInterno(item.readings, item.epochMedidoMs) : false;
@@ -123,6 +196,36 @@ static void dataPostTask(void *param) {
         s_lastWifiOk = wifiOk;
         s_lastTxOk   = txOk;
         s_resultSeq++;
+
+        if (txOk) {
+            havePending    = false;   // se mando -- la proxima vuelta saca el siguiente de la cola
+            fallosSeguidos = 0;
+        } else {
+            // 2026-08-07: ya no se reintenta el mismo item -- se descarta y
+            // se cuenta como perdido. Antes se reintentaba cada
+            // DATAPOST_RETRY_DELAY_MS indefinidamente, pero si GAS tardaba
+            // mas que el timeout del cliente (140s vistos en banco, contra
+            // 20s de http.setTimeout()) igual terminaba escribiendo la fila
+            // -- el reintento generaba una segunda ejecucion de doPost() que
+            // tambien la escribia, duplicando la fila en Lecturas/Ledger.
+            // Por ahora se acepta perder esa ronda puntual para medir cuan
+            // seguido pasa esto antes de decidir si hace falta logica de
+            // verificacion contra tipo=ultima.
+            havePending = false;
+            s_perdidos++;
+            fallosSeguidos++;
+
+            // WiFi.status() dice "conectado" pero la TX igual fallo varias
+            // veces seguidas -- puede ser el router colgado (asociacion WiFi
+            // viva, sin salida real a internet). Chequeo liviano de DNS; si
+            // tampoco resuelve, pide a Core1 que fuerce una reconexion
+            // (nunca la ejecuta esta misma task, ver s_forzarReconexion).
+            if (wifiOk && (fallosSeguidos % DATAPOST_CONECTIVIDAD_CADA_N_FALLOS) == 0) {
+                if (!hayInternetReal()) s_forzarReconexion = true;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(DATAPOST_RETRY_DELAY_MS));
+        }
     }
 }
 
@@ -138,9 +241,15 @@ void dataPost_encolar(const NodeReading readings[NUM_NODES], int64_t epochMedido
     PostItem item;
     memcpy(item.readings, readings, sizeof(item.readings));
     item.epochMedidoMs = epochMedidoMs;
-    // timeout 0 -- nunca bloquea Core 1. Si la cola esta llena (una TX
-    // anterior todavia en vuelo) esta ronda se descarta.
-    xQueueSend(s_queue, &item, 0);
+    // timeout 0 -- nunca bloquea Core 1. Buffer circular: si esta llena
+    // (corte de internet mas largo que DATAPOST_QUEUE_LEN*intervalo), se
+    // descarta el registro MAS VIEJO para hacer lugar al nuevo -- prioridad
+    // a conservar siempre los ultimos ~2 dias, no los primeros del corte.
+    if (xQueueSend(s_queue, &item, 0) != pdTRUE) {
+        PostItem descartado;
+        xQueueReceive(s_queue, &descartado, 0);   // saca el mas viejo (no bloqueante)
+        xQueueSend(s_queue, &item, 0);            // ahora hay lugar
+    }
 }
 
 bool dataPost_ultimoOk() {
@@ -153,4 +262,29 @@ bool dataPost_ultimoWifiOk() {
 
 uint32_t dataPost_resultSeq() {
     return s_resultSeq;
+}
+
+int dataPost_ultimoCode() {
+    return s_lastHttpCode;
+}
+
+const char *dataPost_ultimoResp() {
+    return s_lastRespSnippet;
+}
+
+uint16_t dataPost_pendientes() {
+    if (!s_queue) return 0;
+    return (uint16_t)uxQueueMessagesWaiting(s_queue);
+}
+
+uint32_t dataPost_perdidos() {
+    return s_perdidos;
+}
+
+bool dataPost_debeForzarReconexion() {
+    if (s_forzarReconexion) {
+        s_forzarReconexion = false;   // consumido -- se lee 1 sola vez
+        return true;
+    }
+    return false;
 }

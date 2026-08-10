@@ -1,5 +1,6 @@
 #include "WifiConfig.h"
 #include "GasConfig.h"
+#include "DataPost.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -63,6 +64,12 @@ static bool intentarConectar(const String &ssid, const String &pass, uint8_t int
 
 void wifiConfig_conectar() {
     WiFi.mode(WIFI_STA);
+    // 2026-08-06: reactivado para 2da parte de la prueba A/B -- con el gate
+    // de 200ms del .ino ya puesto, esto aisla si el titileo/TX erratico
+    // de hoy era por el modem-sleep en si o por leer RealClock demasiado
+    // seguido. Si vuelve a titilar, el modem-sleep es la causa real y esta
+    // linea se vuelve a sacar. Ver [[project_presion_diferencial]].
+    WiFi.setSleep(true);
 
     String ssid = prefs.getString("ssid", "");
     String pass = prefs.getString("pass", "");
@@ -163,7 +170,34 @@ void wifiConfig_bootstrap() {
 
 #define WIFI_RECONNECT_INTERVAL_MS  30000   // cada cuanto reintenta si esta caido
 
+// 2026-08-06: reconexion forzada -- DataPost.cpp (Core0) puede detectar que
+// WiFi.status() dice "conectado" pero no hay internet real (router colgado,
+// asociacion WiFi viva) y pedir (nunca ejecutar) que se fuerce una
+// reconexion aca, el unico lugar que toca el WiFi. Maquina de 2 pasos
+// repartida en varias vueltas de loop() (nunca un delay() bloqueante):
+// WiFi.disconnect() en esta vuelta, WiFi.reconnect() recien pasados los
+// ~200ms del bug ya conocido (ver intentarConectar()) en una vuelta
+// posterior -- sin bloquear Core1/picLink_poll() en ningun momento.
+enum ForzarReconexionState { FR_IDLE, FR_ESPERANDO_RECONECTAR };
+static ForzarReconexionState frState        = FR_IDLE;
+static unsigned long         frDisconnectMs = 0;
+
 void wifiConfig_mantener() {
+    if (frState == FR_ESPERANDO_RECONECTAR) {
+        if ((unsigned long)(millis() - frDisconnectMs) >= 200) {
+            WiFi.reconnect();
+            frState = FR_IDLE;
+        }
+        return;   // nada mas esta vuelta -- ni chequeo de "conectado" ni timer normal
+    }
+
+    if (dataPost_debeForzarReconexion()) {
+        WiFi.disconnect(true);
+        frDisconnectMs = millis();
+        frState        = FR_ESPERANDO_RECONECTAR;
+        return;
+    }
+
     if (wifiConfig_conectado()) return;
 
     static unsigned long lastAttempt = 0;

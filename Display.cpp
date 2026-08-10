@@ -25,6 +25,8 @@ static void formatSignedHundredths(int16_t hundredths, char *out, size_t outSize
 #define COL_DATE_X    4
 #define COL_CLOCK_X   58
 #define COL_CLOCK_W   80
+#define COL_QUEUE_X   142   // hueco libre entre el reloj (termina en 138) y la "I" (empieza en 222)
+#define COL_QUEUE_W   72
 #define COL_I_X       222
 
 // columnas de la fila -- presion tiene la columna mas ancha (queda a la
@@ -59,6 +61,7 @@ void DisplayManager::init() {
     digitalWrite(PIN_TFT_BL, LOW);
 
     _displayOn      = false;
+    _debugFreeze    = false;
     _mode           = MODE_TABLA;
     _wasTouched     = false;
     _lastTouchMs    = 0;
@@ -71,6 +74,7 @@ void DisplayManager::init() {
     _dateDirty      = false;
     _clockDirty     = false;
     _internetDirty  = false;
+    _queueDirty     = false;
     _dataDirty      = false;
     memset(_rowDirty, 0, sizeof(_rowDirty));
 
@@ -129,7 +133,12 @@ void DisplayManager::setClock(uint8_t day, uint8_t month, uint8_t year,
 }
 
 void DisplayManager::setQueueCount(uint16_t count) {
-    _queueCount = count;   // no se muestra en pantalla hoy (2026-08-05) -- sin dirty flag propio
+    // 2026-08-06 -- reactivado: muestra el backlog real de DataPost
+    // (dataPost_pendientes()) en la barra de estado.
+    if (_queueCount != count) {
+        _queueCount = count;
+        _queueDirty = true;
+    }
 }
 
 void DisplayManager::setInternetOk(bool ok) {
@@ -137,6 +146,39 @@ void DisplayManager::setInternetOk(bool ok) {
         _internetOk    = ok;
         _internetDirty = true;
     }
+}
+
+void DisplayManager::showPostFail(int code, const char *resp) {
+    _displayOn   = true;
+    _debugFreeze = true;
+    digitalWrite(PIN_TFT_BL, HIGH);
+
+    _tft.fillScreen(TFT_BLACK);
+    _tft.setTextColor(TFT_RED, TFT_BLACK);
+    _tft.drawCentreString("TX FALLO", 120, 8, 4);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "HTTP code: %d", code);
+    _tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    _tft.drawString(buf, 4, 48, 2);
+    _tft.drawString("Respuesta:", 4, 70, 2);
+
+    // wrap manual por caracteres -- ~34 caracteres entran en 232px a font 1
+    const uint8_t FONT = 1;
+    const int     CHARS_POR_LINEA = 34;
+    int len = strlen(resp);
+    int y = 90;
+    for (int i = 0; i < len && y < 300; i += CHARS_POR_LINEA) {
+        char linea[CHARS_POR_LINEA + 1];
+        int n = (len - i < CHARS_POR_LINEA) ? (len - i) : CHARS_POR_LINEA;
+        memcpy(linea, resp + i, n);
+        linea[n] = '\0';
+        _tft.drawString(linea, 4, y, FONT);
+        y += 10;
+    }
+
+    _tft.setTextColor(_tft.color565(120, 120, 120), TFT_BLACK);
+    _tft.drawCentreString("(tocar para volver)", 120, 305, 2);
 }
 
 // -------------------------------------------------------------
@@ -149,6 +191,19 @@ void DisplayManager::update() {
     _wasTouched  = touched;
 
     unsigned long now = millis();
+
+    if (_debugFreeze) {
+        // pantalla congelada por showPostFail() -- ignora toda la maquina de
+        // estados normal (navegacion, timeouts de apagado/grafico) hasta el
+        // primer toque, que descongela y fuerza volver a MODE_TABLA.
+        if (tapEdge) {
+            _debugFreeze    = false;
+            _mode           = MODE_TABLA;
+            _needFullRedraw = true;
+            _lastTouchMs    = now;
+        }
+        return;
+    }
 
     if (tapEdge) {
         if (!_displayOn) {
@@ -209,7 +264,7 @@ void DisplayManager::update() {
             _needFullRedraw = false;
             _dataDirty      = false;
             memset(_rowDirty, 0, sizeof(_rowDirty));
-        } else if (_dateDirty || _clockDirty || _internetDirty) {
+        } else if (_dateDirty || _clockDirty || _internetDirty || _queueDirty) {
             _drawStatusBar();   // redibuja solo las zonas que cambiaron, limpia sus propios flags
         } else {
             didDraw = false;
@@ -260,18 +315,18 @@ int8_t DisplayManager::_hitTestRow(int16_t y) const {
 // -------------------------------------------------------------
 void DisplayManager::_drawTablaFull() {
     _tft.fillScreen(TFT_BLACK);
-    // fillScreen borro las 3 zonas de la barra de estado -- forzar que
+    // fillScreen borro las 4 zonas de la barra de estado -- forzar que
     // _drawStatusBar() las repinte todas, sin importar si habian cambiado
     // de verdad (si no, quedarian en negro/invisibles tras el fillScreen)
-    _dateDirty = _clockDirty = _internetDirty = true;
+    _dateDirty = _clockDirty = _internetDirty = _queueDirty = true;
     _drawStatusBar();
     _drawRows();
 }
 
 // -------------------------------------------------------------
-// _drawStatusBar -- franja de arriba, 3 zonas independientes (fecha/hora/
-// "I"), cada una repinta SOLO su propio rectangulo -- evita repintar (y
-// titilar) partes que no cambiaron.
+// _drawStatusBar -- franja de arriba, 4 zonas independientes (fecha/hora/
+// backlog de cola/"I"), cada una repinta SOLO su propio rectangulo -- evita
+// repintar (y titilar) partes que no cambiaron.
 // -------------------------------------------------------------
 void DisplayManager::_drawStatusBar() {
     if (_dateDirty) {
@@ -290,6 +345,21 @@ void DisplayManager::_drawStatusBar() {
         _tft.setTextColor(TFT_WHITE, TFT_BLACK);
         _tft.drawString(buf, COL_CLOCK_X, 3, 2);
         _clockDirty = false;
+    }
+
+    if (_queueDirty) {
+        _tft.fillRect(COL_QUEUE_X, 0, COL_QUEUE_W, STATUS_H - 1, TFT_BLACK);
+        // "C" de "Cola" -- "P" ya significa presion en este proyecto (campo
+        // "p" del JSON, columnas P_1..P_15 en Sheets), usarlo aca confundiria.
+        // Solo se muestra si hay backlog -- en operacion normal (cola vacia)
+        // no vale la pena ocupar espacio con "C:0" todo el tiempo.
+        if (_queueCount > 0) {
+            char buf[10];
+            snprintf(buf, sizeof(buf), "C:%u", (unsigned)_queueCount);
+            _tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+            _tft.drawString(buf, COL_QUEUE_X, 3, 2);
+        }
+        _queueDirty = false;
     }
 
     if (_internetDirty) {

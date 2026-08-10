@@ -40,6 +40,14 @@ public:
     // (dataPost_ultimoOk(), ver .ino), no WiFi.status() en vivo.
     void setInternetOk(bool ok);
 
+    // diagnostico 2026-08-06 -- pantalla completa congelada con el HTTP code
+    // y el body de la ultima respuesta fallida del POST a GAS. Prende el
+    // display si estaba apagado, ignora touch/timeouts normales (no navega
+    // de tabla a grafico, no se apaga solo) hasta el primer toque, que
+    // vuelve a MODE_TABLA. Pensado para leer el dato en banco y pasarlo,
+    // sin Serial disponible con el PICG conectado.
+    void showPostFail(int code, const char *resp);
+
     bool isOn() const { return _displayOn; }
 
     // maximo tiempo de redibujo observado (ms) -- cualquier draw call que
@@ -53,6 +61,7 @@ private:
 
     DisplayMode  _mode;
     bool         _displayOn;
+    bool         _debugFreeze;   // ver showPostFail()
     bool         _wasTouched;
     unsigned long _lastTouchMs;
     uint8_t      _selectedNode;
@@ -76,6 +85,7 @@ private:
     bool    _dateDirty;
     bool    _clockDirty;
     bool    _internetDirty;
+    bool    _queueDirty;             // 2026-08-06 -- backlog de DataPost (dataPost_pendientes())
     bool    _dataDirty;              // cualquier lectura de nodo cambio -> redibuja la tabla completa
     bool    _rowDirty[NUM_NODES];    // por nodo -- usado en MODE_GRAFICO para el nodo seleccionado
 

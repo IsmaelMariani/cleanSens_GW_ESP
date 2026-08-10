@@ -8,6 +8,7 @@
 #include "WifiConfig.h"
 #include "DataPost.h"
 #include "RealClock.h"
+#include "Averager.h"
 
 // =============================================================
 // cleanSensGateway_v001.ino
@@ -156,6 +157,7 @@ void setup() {
     wifiConfig_bootstrap();
     realClock_init();   // configTime() -- el sync real llega asincronico, ver loop()
     dataPost_init();
+    averager_init();
 
     display.endBootMessage();
 
@@ -185,34 +187,79 @@ void loop() {
     // ROUND_CLOSED: el resync ya se proceso (ACK mandado, OSCTUNE/fase del
     // pic-g corregidos del otro lado) y PicLink.cpp ya blanqueo las UTAs
     // ausentes esta ronda -- recien aca conviene redibujar la tabla completa.
-    // TX a GAS cada 2 rondas (~2min, no cada ronda) -- dataPost_encolar()
-    // nunca bloquea esta vuelta de loop(), el POST real corre en la task de
-    // Core 0 (ver DataPost.h).
     if (picEv == PicLinkEvent::ROUND_CLOSED) {
-        display.setReadings(readings);
-
-        static uint8_t rondasParaTx = 0;
-        if (++rondasParaTx >= 2) {
-            rondasParaTx = 0;
-            dataPost_encolar(readings, realClock_epochMs());   // epochMs=0 (fyhMedido:null) si RealClock todavia no sincronizo
-        }
+        display.setReadings(readings);   // pantalla siempre muestra el dato crudo de la ultima ronda, no el promedio
+        averager_agregar(readings);      // acumula para el promedio del proximo POST (ver Averager.h)
     }
 
     // resultado de la ultima TX (no WiFi.status() en vivo, ver DataPost.h)
     display.setInternetOk(dataPost_ultimoOk());
 
+    // diagnostico 2026-08-06 -- si la TX fallo (con WiFi conectado, para que
+    // code/resp tengan sentido -- si wifiOk fue false ni se intento el POST),
+    // congela pantalla completa con el HTTP code + body real, ver
+    // DisplayManager::showPostFail(). static local, solo dispara 1x por
+    // resultado nuevo (dataPost_resultSeq() cambia 1x por ciclo).
+    static uint32_t lastPostSeqSeen = 0;
+    uint32_t postSeq = dataPost_resultSeq();
+    if (postSeq != lastPostSeqSeen) {
+        lastPostSeqSeen = postSeq;
+        if (!dataPost_ultimoOk() && dataPost_ultimoWifiOk()) {
+            display.showPostFail(dataPost_ultimoCode(), dataPost_ultimoResp());
+        }
+    }
+
     // hora real (RealClock) una vez sincronizada -- antes del primer sync
     // NTP (o si se cae por mucho tiempo antes de arrancar) sigue mostrando
     // el reloj simulado local, nunca se congela la pantalla.
-    if (realClock_valido()) {
-        uint8_t rDay, rMonth, rYear, rHour, rMinute, rSecond;
-        realClock_obtener(rDay, rMonth, rYear, rHour, rMinute, rSecond);
-        display.setClock(rDay, rMonth, rYear, rHour, rMinute, rSecond);
-    } else {
-        display.setClock(simDay, simMonth, simYear, minutero / 60, minutero % 60, segundero);
+    //
+    // 2026-08-06: el TX a GAS se desacopla por completo de los frames del
+    // PICG (ROUND_CLOSED) -- a pedido del usuario, ahora es 100% por reloj
+    // real: cada 2 minutos exactos (minuto par, segundo 0) se manda lo que
+    // haya en readings[] en ese instante, sea data fresca, parcial o todo
+    // sentinel (arma un JSON con nulls -- procesarMedicion() igual escribe
+    // la fila, con timestamp real, para que el log muestre el hueco en vez
+    // de faltar la fila entera). Sin relacion entre cantidad de frames
+    // recibidos del PICG y cuando se dispara el POST. Solo corre una vez
+    // que RealClock sincronizo -- sin hora real no tiene sentido
+    // timestampear el POST.
+    // 2026-08-06: el chequeo de reloj real (display + condicion de TX) se
+    // limita a 1x cada 200ms -- loop() corre miles de veces por segundo,
+    // leer/comparar el reloj tan seguido no aporta nada (ni la pantalla ni
+    // la ventana de TX necesitan mas resolucion que eso) y de paso reduce
+    // dracticamente cuantas veces por segundo se toca RealClock, por si el
+    // titileo observado en banco viene de leerlo con esa frecuencia.
+    static unsigned long lastClockCheckMs = 0;
+    if ((unsigned long)(millis() - lastClockCheckMs) >= 200) {
+        lastClockCheckMs = millis();
+
+        if (realClock_valido()) {
+            uint8_t rDay, rMonth, rYear, rHour, rMinute, rSecond;
+            realClock_obtener(rDay, rMonth, rYear, rHour, rMinute, rSecond);
+            display.setClock(rDay, rMonth, rYear, rHour, rMinute, rSecond);
+
+            // flag simple "ya transmiti" -- mismo patron que sentThisRound/
+            // firedThisCycle del lado PICG. Mientras dure la ventana (segundo
+            // 0, minuto multiplo de AVERAGER_INTERVAL_MIN) no vuelve a
+            // disparar; en cuanto sale de la ventana (segundo != 0) se rearma
+            // para la proxima vez que entre.
+            static bool yaTransmiti = false;
+            if (rSecond == 0 && (rMinute % AVERAGER_INTERVAL_MIN) == 0) {
+                if (!yaTransmiti) {
+                    NodeReading avgReadings[NUM_NODES];
+                    averager_calcularYresetear(avgReadings);   // promedio de presion + ultimo temp/vbat/idNodo valido de la ventana
+                    dataPost_encolar(avgReadings, realClock_epochMs());
+                    yaTransmiti = true;
+                }
+            } else {
+                yaTransmiti = false;
+            }
+        } else {
+            display.setClock(simDay, simMonth, simYear, minutero / 60, minutero % 60, segundero);
+        }
     }
 
-    display.setQueueCount(0);   // cola SD pendiente -- todavia no implementada
+    display.setQueueCount(dataPost_pendientes());   // backlog real de DataPost (buffer circular, ver DataPost.h)
     display.update();
 }
 
