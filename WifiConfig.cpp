@@ -28,6 +28,19 @@
 
 static Preferences prefs;
 
+// 2026-08-10: cache en RAM de las 4 credenciales -- flash (Preferences/NVS)
+// solo se toca en wifiConfig_init() (1 vez, boot) y al escribir una
+// actualizacion nueva (wifiConfig_actualizarDesdeSheet()). Todo el resto del
+// modulo (conectar/reconectar, incluido el reintento periodico de
+// wifiConfig_mantener()) lee de aca, nunca de prefs directo -- un acceso a
+// flash invalida la cache de instrucciones de AMBOS cores del ESP32 (misma
+// flash fisica para datos y codigo), pudiendo stallear brevemente el Core 1
+// justo cuando picLink_poll() esta a mitad de leer un frame del PICG por
+// UART. Sospecha real de banco: reintentos de WiFi.begin() (que antes leian
+// prefs.getString() en cada llamada) coincidiendo con perdida de frames del
+// PICG -- ver [[project_presion_diferencial]].
+static String s_ssid, s_pass, s_ssidFb, s_passFb;
+
 void wifiConfig_init() {
     prefs.begin("wifi", false);
     if (!prefs.isKey("ssid")) {
@@ -38,6 +51,11 @@ void wifiConfig_init() {
         prefs.putString("ssidFb", SEMILLA_SSID);
         prefs.putString("passFb", SEMILLA_PASS);
     }
+
+    s_ssid   = prefs.getString("ssid", "");
+    s_pass   = prefs.getString("pass", "");
+    s_ssidFb = prefs.getString("ssidFb", "");
+    s_passFb = prefs.getString("passFb", "");
 }
 
 static bool intentarConectar(const String &ssid, const String &pass, uint8_t intentos) {
@@ -64,6 +82,12 @@ static bool intentarConectar(const String &ssid, const String &pass, uint8_t int
 
 void wifiConfig_conectar() {
     WiFi.mode(WIFI_STA);
+    // no persistir a la NVS interna de WiFi en cada begin() -- ya tenemos
+    // nuestra propia persistencia via Preferences/RAM (ver arriba), esta es
+    // pura redundancia y significa una escritura a flash (stall de ambos
+    // nucleos) por cada intento de conexion, incluidos los periodicos de
+    // wifiConfig_mantener() durante un corte largo. 2026-08-10.
+    WiFi.persistent(false);
     // 2026-08-06: reactivado para 2da parte de la prueba A/B -- con el gate
     // de 200ms del .ino ya puesto, esto aisla si el titileo/TX erratico
     // de hoy era por el modem-sleep en si o por leer RealClock demasiado
@@ -71,16 +95,18 @@ void wifiConfig_conectar() {
     // linea se vuelve a sacar. Ver [[project_presion_diferencial]].
     WiFi.setSleep(true);
 
-    String ssid = prefs.getString("ssid", "");
-    String pass = prefs.getString("pass", "");
-    if (intentarConectar(ssid, pass, WIFI_CONNECT_ATTEMPTS)) return;
+    // 2026-08-10: orden invertido a pedido del usuario -- celu PRIMERO (1
+    // intento, rapido -- en campo nunca va a estar presente, no vale la pena
+    // gastarle mas de 1 intento) y activa despues (3 intentos, la conexion
+    // real esperada). El celu solo se usa en el momento de instalar (el
+    // instalador esta ahi con el hotspot prendido); de ahi en mas el celu no
+    // se vuelve a intentar nunca (ver wifiConfig_mantener()) -- si el
+    // instalador necesita cambiar la credencial activa, la actualiza via
+    // Config_WiFi/GAS (conectado por celu en ese momento) y resetea la
+    // placa, no hace falta logica de "probar la nueva al toque".
+    if (intentarConectar(s_ssidFb, s_passFb, 1)) return;
 
-    // activa agoto sus intentos -- cae al fallback (celu), nunca tocado por
-    // la actualizacion remota (wifiConfig_actualizarDesdeSheet() solo
-    // escribe "ssid"/"pass", jamas "ssidFb"/"passFb")
-    String fbSsid = prefs.getString("ssidFb", "");
-    String fbPass = prefs.getString("passFb", "");
-    intentarConectar(fbSsid, fbPass, 1);
+    intentarConectar(s_ssid, s_pass, WIFI_CONNECT_ATTEMPTS);
 }
 
 bool wifiConfig_conectado() {
@@ -129,15 +155,17 @@ bool wifiConfig_actualizarDesdeSheet() {
 
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
+    s_ssid = ssid;   // cache en RAM al dia -- ver comentario grande junto a su declaracion
+    s_pass = pass;
     return true;
 }
 
 String wifiConfig_activaStr() {
-    return prefs.getString("ssid", "") + " / " + prefs.getString("pass", "");
+    return s_ssid + " / " + s_pass;
 }
 
 String wifiConfig_fallbackStr() {
-    return prefs.getString("ssidFb", "") + " / " + prefs.getString("passFb", "");
+    return s_ssidFb + " / " + s_passFb;
 }
 
 // orquesta la secuencia completa -- unico punto de entrada que hace falta
@@ -162,9 +190,7 @@ void wifiConfig_bootstrap() {
 
         if (!wifiConfig_actualizarDesdeSheet()) return;
 
-        String ssid = prefs.getString("ssid", "");
-        String pass = prefs.getString("pass", "");
-        if (intentarConectar(ssid, pass, WIFI_CONNECT_ATTEMPTS)) return;
+        if (intentarConectar(s_ssid, s_pass, WIFI_CONNECT_ATTEMPTS)) return;
     }
 }
 
@@ -204,5 +230,13 @@ void wifiConfig_mantener() {
     if ((unsigned long)(millis() - lastAttempt) < WIFI_RECONNECT_INTERVAL_MS) return;
     lastAttempt = millis();
 
-    WiFi.reconnect();   // no bloqueante -- reusa la ultima credencial que WiFi.begin() probo
+    // 2026-08-10: SIEMPRE activa, nunca celu -- a diferencia de
+    // WiFi.reconnect() (que reintenta la ultima credencial que se probo, y
+    // si el boot conecto por celu -- instalacion -- quedaria reintentando
+    // celu para siempre tras una caida posterior), esto apunta directo a la
+    // credencial guardada pase lo que pase. El celu es solo para el momento
+    // de instalar (ver wifiConfig_conectar()), nunca para reconexion en
+    // operacion. WiFi.begin() no bloquea (a diferencia de intentarConectar()).
+    if (s_ssid.length() == 0) return;
+    WiFi.begin(s_ssid.c_str(), s_pass.c_str());
 }

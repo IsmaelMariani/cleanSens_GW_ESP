@@ -16,15 +16,18 @@
 //                          principio) -- de ahi en mas nunca se vuelve a
 //                          tocar por codigo, solo la activa se actualiza.
 //
-// Secuencia de conexion (wifiConfig_conectar()): intenta la activa hasta
-// WIFI_CONNECT_ATTEMPTS veces: si agota los intentos sin conectar, cae a la
-// de fallback. Resuelve el huevo-y-gallina de bootstrap (el ESP32 no puede
-// bajar la config real de WiFi si todavia no tiene WiFi) -- el fallback
-// siempre lleva a internet.
+// Secuencia de conexion (wifiConfig_conectar(), 2026-08-10): intenta PRIMERO
+// el fallback (celu, 1 intento -- solo esta presente en el momento de
+// instalar, no vale la pena gastarle mas) y RECIEN DESPUES la activa (hasta
+// WIFI_CONNECT_ATTEMPTS veces, la conexion real esperada en operacion). El
+// celu es exclusivamente una ayuda de instalacion (el instalador la usa para
+// llegar a internet y actualizar Config_WiFi/GAS con la red real del sitio,
+// despues resetea la placa) -- nunca se vuelve a intentar en operacion
+// normal, ver wifiConfig_mantener().
 // =============================================================
 
 void wifiConfig_init();      // siembra activa+fallback en flash si hace falta -- llamar 1x en setup(), antes de conectar
-void wifiConfig_conectar();  // bloqueante: activa (hasta 3 intentos) -> fallback (1 intento) si la activa no prendio
+void wifiConfig_conectar();  // bloqueante: fallback/celu (1 intento) -> activa (hasta 3 intentos) si el celu no esta
 bool wifiConfig_conectado(); // WL_CONNECTED?
 String wifiConfig_ipStr();   // IP actual como texto, "" si no conectado -- solo para debug
 
@@ -44,10 +47,11 @@ bool wifiConfig_actualizarDesdeSheet();
 void wifiConfig_bootstrap();
 
 // Llamar 1x por vuelta de loop() (produccion) -- si esta desconectado,
-// reintenta cada WIFI_RECONNECT_INTERVAL_MS con WiFi.reconnect() (NO
-// bloqueante, reusa la ultima credencial que se probo -- activa o
-// fallback). No repite el bootstrap completo (eso bloquearia loop() varios
-// segundos y arruinaria el timing de picLink_poll() con el PICG).
+// reintenta cada WIFI_RECONNECT_INTERVAL_MS con WiFi.begin() apuntando
+// SIEMPRE a la credencial activa (NO bloqueante) -- nunca al celu, ni
+// siquiera si el boot conecto por ahi (instalacion). No repite el bootstrap
+// completo (eso bloquearia loop() varios segundos y arruinaria el timing de
+// picLink_poll() con el PICG).
 void wifiConfig_mantener();
 
 // Solo debug -- credenciales actuales en flash, "ssid / pass" en texto
