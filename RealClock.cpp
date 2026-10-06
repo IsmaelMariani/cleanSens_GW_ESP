@@ -1,13 +1,34 @@
+// 2026-09-30 19:23 - resincronizar() por ventana de radio
 #include "RealClock.h"
 #include <Arduino.h>
 #include <time.h>
+#include "esp_sntp.h"
 
 // =============================================================
 // RealClock.cpp -- ver RealClock.h para el diseño.
 // =============================================================
 
+static volatile bool s_syncReciente = false;
+
+// callback del cliente SNTP: se dispara cuando el servidor contesto y se ajusto la hora
+static void onTimeSync(struct timeval *tv) {
+    (void)tv;
+    s_syncReciente = true;
+}
+
 void realClock_init() {
+    sntp_set_time_sync_notification_cb(onTimeSync);
     configTime(REALCLOCK_GMT_OFFSET_SEC, 0, REALCLOCK_NTP_SERVER);
+}
+
+// configTime() reinicia el cliente SNTP, que manda un request de inmediato
+void realClock_resincronizar() {
+    s_syncReciente = false;
+    configTime(REALCLOCK_GMT_OFFSET_SEC, 0, REALCLOCK_NTP_SERVER);
+}
+
+bool realClock_sincronizoReciente() {
+    return s_syncReciente;
 }
 
 bool realClock_valido() {

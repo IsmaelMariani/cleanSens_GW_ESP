@@ -1,3 +1,5 @@
+// 2026-09-30 19:44 - Evento boot (motivo de reset + contador) a GAS
+// 2026-09-30 19:23 - Reescrito: ventanas de radio, reintento, anillo
 #pragma once
 
 #include "SharedTypes.h"
@@ -14,86 +16,77 @@
 // referencia de que UTA es cada dato. Contrato verificado contra el
 // doPost()/procesarMedicion() real (2026-08-05).
 //
-// El POST en si corre en una task de FreeRTOS pinneada a Core 0 -- nunca en
-// el loop() de Core 1 (picLink_poll()/fino/segundero, timing vital con el
-// PICG). La task NO TOCA el WiFi -- no conecta, no desconecta, no cambia de
-// modo -- solo revisa WiFi.status() y manda si ya esta conectado. Mantener
-// la conexion (wifiConfig_conectar()/wifiConfig_mantener()) sigue siendo
-// 100% responsabilidad de loop()/Core 1 -- separar "quien mantiene la
-// conexion" de "quien manda el dato" evito el bug de reconexion de un
-// primer intento de este mismo diseño (mezclaba las dos cosas en la task).
+// El POST corre en una task de FreeRTOS pinneada a Core 0 -- nunca en el
+// loop() de Core 1 (picLink_poll()/fino/segundero, timing vital con el PICG).
+// La task NO TOCA el WiFi: solo manda cuando WifiPower.h dice que hay una
+// ventana abierta con el radio conectado (wifiPower_enlaceListo()).
 //
-// WiFi queda SIEMPRE conectado (no se apaga entre TX) -- se probo bajar
-// consumo apagando el radio y resulto poco confiable en banco. Ahorro de
-// bajo consumo queda pendiente para retomar mas adelante, con mas margen
-// de testeo.
-//
-// dataPost_encolar() -- unica funcion que se llama desde loop() -- copia
-// readings[] a una cola FreeRTOS (xQueueSend timeout 0, nunca bloquea) y
-// vuelve al toque.
-//
-// 2026-08-06: buffer circular en RAM (no SD) de DATAPOST_QUEUE_LEN
-// registros (~2 dias a intervalo minimo, ver DataPost.cpp) -- si se corta
-// internet, los promedios se siguen acumulando en la cola en vez de
-// perderse; si la cola se llena (corte mas largo que eso), se descarta el
-// MAS VIEJO para hacer lugar al nuevo (siempre se conservan los ultimos
-// ~2 dias).
-//
-// 2026-08-07: la task de Core 0 YA NO reintenta un envio fallido -- lo
-// descarta y sigue con el siguiente de la cola (ver dataPost_perdidos()).
-// Antes reintentaba el mismo cada DATAPOST_RETRY_DELAY_MS hasta que salia
-// bien, pero si GAS tardaba mas que el timeout del cliente (140s vistos en
-// banco contra 20s de timeout) el reintento terminaba disparando una
-// segunda ejecucion de doPost() que tambien escribia la fila, duplicando el
-// dato en Lecturas/Ledger. Se acepta perder esa ronda puntual por ahora
-// para medir cuan seguido pasa antes de decidir si hace falta logica de
-// verificacion contra tipo=ultima.
+// 2026-09-30 -- COLA Y REINTENTOS (sin tocar GAS):
+//   * Buffer circular en RAM (heap) de DATAPOST_QUEUE_LEN registros (576 =
+//     ~6 dias a 15 min). Si se llena, se descarta el MAS VIEJO.
+//   * Un registro sale de la cola SOLO si se da por escrito:
+//       - HTTP 302: el script de GAS termino sin excepcion no capturada.
+//       - -11 (HTTPC_ERROR_READ_TIMEOUT): el POST ya salio; GAS sigue
+//         ejecutando y graba igual aunque el cliente corte a los 20 s
+//         (observado en banco, el doPost puede tardar hasta ~200 s). Se da
+//         por entregado -- reintentarlo duplicaria la fila.
+//   * Cualquier otro resultado se reintenta en la PROXIMA ventana (nunca en
+//     la misma, para no superponer ejecuciones de doPost):
+//       - el POST nunca salio (radio sin conectar, DNS, TLS, conexion
+//         rechazada): reintento sin limite hasta que la cola lo desplace.
+//       - conexion cortada a mitad de envio (-3/-5): ambiguo -- puede haber
+//         llegado; se reintenta y se cuenta en dataPost_ambiguos() (riesgo
+//         residual: una fila duplicada, nunca un dato perdido).
+//       - GAS respondio algo que no es 302: se cuenta un fallo por registro;
+//         a los DATAPOST_MAX_FALLOS_HTTP se descarta (error permanente, no
+//         debe trabar la cola).
+//   * Tope de DATAPOST_MAX_POR_VENTANA envios por ventana, y un fallo corta
+//     el envio del resto de esa ventana.
 // =============================================================
 
-void dataPost_init();      // crea la queue + la task de envio (Core 0) -- llamar 1x en setup()
+void dataPost_init();      // reserva la cola + crea la task de envio (Core 0) -- llamar 1x en setup()
 
-// no bloqueante -- llamar desde loop() (Core 1) cuando toque transmitir
-// (cada 2 rondas = ~2min, ver .ino). epochMedidoMs: hora real (ver
-// RealClock.h) de cuando se cerro esta ronda, 0 si todavia no hay sync NTP
-// (manda "fyhMedido":null en ese caso).
+// no bloqueante -- llamar desde loop() (Core 1) cuando cierra un bloque.
+// epochMedidoMs: instante de cierre del bloque (clave unica del registro, ver
+// .ino), 0 si no hay hora real (manda "fyhMedido":null -> 1970-01-01 en la
+// hoja, marca de dato de prueba o sin sync).
 void dataPost_encolar(const NodeReading readings[NUM_NODES], int64_t epochMedidoMs);
 
-// resultado de la ultima TX intentada (true=exito, false=fallo o todavia
-// ninguna) -- para el indicador "I" del display (ver .ino), a pedido
-// explicito del usuario ("la I guarda el color segun si pudo TX o no") en
-// vez de WiFi.status() en vivo.
+// 2026-09-30: evento de arranque. Se encola en setup() con el motivo del reset
+// (esp_reset_reason_t) y el contador de reinicios (persistido en flash por el
+// .ino). Viaja por la MISMA cola y con las mismas reglas de entrega que las
+// mediciones. JSON: {"tipo":"evento","ev":"boot","fyh":<epoch ms del boot o
+// null>,"motivo":"PANIC","reinicios":N,"fw":"..."}. El doPost() de GAS tiene
+// que tener una rama tipo "evento" que lo grabe (hoja Log_Eventos de
+// PresionDif_JIM); con un GAS sin esa rama el evento se da por entregado (302)
+// y se pierde en silencio. fyh: se calcula al ENVIAR (hora real - millis()), asi
+// es el instante real del boot aunque el envio se demore; el envio espera hasta
+// 30 s a que haya hora real (NTP) tras el arranque.
+void dataPost_encolarBoot(uint8_t resetReason, uint32_t reinicios);
+
+// -- handshake con WifiPower.cpp (Core 0) --
+void dataPost_nuevaVentana();   // abre una ventana: rearma el tope de envios y el corte por fallo
+bool dataPost_inactivo();       // true si ya no va a mandar nada mas en esta ventana (cola vacia, tope o fallo) y no hay POST en vuelo
+bool dataPost_enVuelo();        // true mientras hay un POST en curso
+
+// resultado del ultimo envio intentado (true = dado por escrito: 302 o -11)
 bool dataPost_ultimoOk();
 
-// si el ultimo ciclo encontro WiFi ya conectado -- separado de
-// dataPost_ultimoOk() porque son 2 fallas distintas (no habia conexion vs.
-// conecto pero el POST/GAS fallo), util para mostrar en pantalla cual de
-// las dos paso (ver .ino).
+// si el ultimo intento encontro WiFi ya conectado
 bool dataPost_ultimoWifiOk();
 
-// incrementa 1x por ciclo completo (exitoso o no) -- para que loop() detecte
-// "hay resultado nuevo" sin tener que comparar los booleans de arriba.
+// incrementa 1x por intento de envio -- para que loop() detecte "hay resultado nuevo"
 uint32_t dataPost_resultSeq();
 
-// diagnostico 2026-08-06 -- HTTP code crudo y fragmento (119 chars) del body
-// de la ultima respuesta -- para mostrar en pantalla si la TX fallo (ver
-// DisplayManager::showPostFail() / .ino), sin Serial disponible en banco.
+// HTTP code crudo y fragmento (119 chars) del body de la ultima respuesta
 int dataPost_ultimoCode();
 const char *dataPost_ultimoResp();
 
-// cuantos registros hay esperando en la cola ahora mismo (no consume nada,
-// solo lee) -- util para mostrar en pantalla si hay backlog acumulado por
-// un corte de internet.
+// cuantos registros hay esperando en la cola ahora mismo
 uint16_t dataPost_pendientes();
 
-// cuantos envios se descartaron tras fallar (2026-08-07) -- contador interno
-// desde el boot, sin mostrar en pantalla todavia. Sirve para medir cuan
-// seguido pasa esto antes de decidir si hace falta logica de verificacion
-// (GET a tipo=ultima) antes de reintentar en vez de descartar directo.
-uint32_t dataPost_perdidos();
-
-// true si la task de Core 0 detecto que WiFi.status() dice "conectado" pero
-// ni siquiera resuelve DNS (router colgado) y quiere que Core1 fuerce una
-// reconexion -- se consume solo (vuelve a false) al leerla. Llamar desde
-// wifiConfig_mantener() (unico lugar que puede tocar el WiFi), nunca desde
-// esta misma task.
-bool dataPost_debeForzarReconexion();
+// contadores desde el boot
+uint32_t dataPost_perdidos();    // descartados: cola llena o GAS rechazo DATAPOST_MAX_FALLOS_HTTP veces
+uint32_t dataPost_entregados();  // dados por escrito (302 + timeouts)
+uint32_t dataPost_timeouts();    // de los entregados, cuantos fueron -11
+uint32_t dataPost_ambiguos();    // cortes a mitad de envio (-3/-5), reintentados

@@ -1,28 +1,24 @@
+// 2026-09-30 19:44 - Evento boot (motivo de reset + contador) a GAS
+// 2026-09-30 19:23 - Reescrito: ventanas de radio, reintento, anillo
 #include "DataPost.h"
 #include "GasConfig.h"
+#include "GatewayConfig.h"
+#include "WifiPower.h"
+#include "RealClock.h"
+#include <time.h>
+#include <esp_system.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <string.h>
+#include <stdlib.h>
 
 // =============================================================
-// DataPost.cpp -- ver DataPost.h para el diseño.
-//
-// 2026-08-05: el POST (http.POST(), bloqueante, puede tardar varios
-// segundos) corre en una task de FreeRTOS pinneada a Core 0 -- nunca en el
-// loop() de Core 1, que es donde vive picLink_poll()/fino/segundero (el
-// timing con el PICG por UART es vital). A diferencia del primer intento de
-// este mismo diseño (mismo dia, descartado): esta task NO TOCA el WiFi para
-// nada -- no conecta, no desconecta, no cambia de modo. Solo mira
-// WiFi.status() y, si ya esta conectado, manda. La conexion/reconexion
-// (wifiConfig_conectar()/wifiConfig_mantener()) sigue siendo responsabilidad
-// exclusiva de loop()/Core 1 -- separar del todo "quien mantiene la
-// conexion" de "quien manda el dato" evito repetir el bug de reconexion que
-// tuvo el intento anterior.
+// DataPost.cpp -- ver DataPost.h para el diseño (cola, ventanas, reintentos).
 // =============================================================
 
 // stack grande a proposito -- WiFiClientSecure/mbedTLS (handshake TLS)
@@ -30,76 +26,52 @@
 #define DATAPOST_TASK_STACK_BYTES  10240
 #define DATAPOST_TASK_CORE         0        // nunca Core 1 (loop()/picLink_poll/UART)
 
-// 2026-08-06: buffer de cortes de internet -- antes 2 (1 en vuelo + 1
-// recien encolada), ahora dimensionado para no perder datos durante un
-// corte largo. 576 = 2 dias / 5min (el intervalo minimo que va a pedir el
-// cliente, ver Averager.h -- dimensionar contra el minimo es el caso
-// conservador: con un intervalo mayor, estos mismos registros cubren MAS
-// de 2 dias, nunca menos). PostItem pesa ~100 bytes -> ~58KB total, contra
-// ~280KB de heap libre medidos en banco en operacion normal (WiFi+display+
-// esta misma task activos) -- deja margen de sobra para todo lo que falta
-// implementar (sistema de alertas, etc.).
+// 576 registros = ~6 dias a 15 min (~64KB de heap, contra ~280KB libres)
 #define DATAPOST_QUEUE_LEN         576
 
-// cada cuanto reintenta el envio mas viejo si fallo -- mismo ritmo que
-// wifiConfig_mantener() (no tiene sentido reintentar mas seguido que lo
-// que la propia capa de WiFi intenta reconectar).
-#define DATAPOST_RETRY_DELAY_MS    30000
+#define DATAPOST_MAX_POR_VENTANA   8
+#define DATAPOST_MAX_FALLOS_HTTP   5
 
-// cada cuantos fallos SEGUIDOS (con WiFi.status() diciendo "conectado") se
-// chequea conectividad real -- ver hayInternetReal()/s_forzarReconexion mas
-// abajo.
-#define DATAPOST_CONECTIVIDAD_CADA_N_FALLOS  3
+#define TIPO_MEDICION  0
+#define TIPO_EVENTO    1
 
 struct PostItem {
-    NodeReading readings[NUM_NODES];
+    NodeReading readings[NUM_NODES];   // solo TIPO_MEDICION
     int64_t     epochMedidoMs;
+    uint32_t    seq;          // identidad del registro (asignada al encolar)
+    uint8_t     fallosHttp;   // cuantas veces GAS respondio algo que no es 302
+    uint8_t     tipo;         // TIPO_MEDICION / TIPO_EVENTO
+    uint8_t     resetReason;  // solo TIPO_EVENTO: esp_reset_reason_t
+    uint32_t    reinicios;    // solo TIPO_EVENTO: contador de reinicios
 };
 
-static QueueHandle_t s_queue = nullptr;
+// -- cola circular en heap, protegida por mutex (encolar corre en Core 1, la
+// task de envio en Core 0; descartar el mas viejo al llenarse podria pisar el
+// registro que esta en vuelo, por eso la baja se hace por seq, ver abajo) --
+static PostItem         *s_ring  = nullptr;
+static uint16_t          s_len   = 0;
+static volatile uint16_t s_head  = 0;
+static volatile uint16_t s_count = 0;
+static uint32_t          s_nextSeq = 1;
+static SemaphoreHandle_t s_mutex = nullptr;
 
-// resultado del ultimo ciclo -- 1 sola escritora (la task de Core 0), 1 sola
-// lectora (loop() en Core 1). bools de 1 byte: lectura/escritura atomica en
-// la practica, no hace falta mutex para flags asi. wifiOk separado de txOk
-// -- 2 fallas distintas a distinguir en pantalla (no habia conexion vs.
-// conecto pero el POST/GAS fallo). s_resultSeq incrementa 1x por ciclo
-// completo, para que loop() detecte "hay resultado nuevo" sin comparar
-// booleans.
+// estado de la ventana actual
+static volatile bool     s_ventanaAgotada   = false;
+static volatile uint8_t  s_enviadosVentana  = 0;
+static volatile bool     s_enVuelo          = false;
+
+// resultado del ultimo intento (1 escritora: la task de Core 0)
 static volatile bool     s_lastWifiOk = false;
 static volatile bool     s_lastTxOk   = false;
 static volatile uint32_t s_resultSeq  = 0;
+static volatile int      s_lastHttpCode = -1;
+static char              s_lastRespSnippet[120] = {0};
 
-// 2026-08-07: cuantos envios se descartaron tras fallar (ver dataPostTask()
-// mas abajo) -- contador interno, sin mostrar en pantalla todavia, para
-// medir cuan seguido pasa esto antes de decidir si hace falta logica de
-// verificacion contra tipo=ultima.
-static volatile uint32_t s_perdidos = 0;
-
-// diagnostico 2026-08-06 -- code crudo + fragmento del body de la ultima
-// respuesta HTTP, mismo criterio de "unica escritora/unica lectora" que los
-// bools de arriba. code=-1 si http.begin() fallo o si no hubo intento
-// (WiFi no conectado). Se muestran en pantalla cuando la TX falla, ver
-// DisplayManager::showPostFail() / .ino.
-static volatile int s_lastHttpCode = -1;
-static char         s_lastRespSnippet[120] = {0};
-
-// 2026-08-06 -- pedido de reconexion forzada, Core0 (esta task) -> Core1
-// (wifiConfig_mantener()). Escritora: esta task, cuando WiFi.status() dice
-// "conectado" pero ni siquiera resuelve DNS (router colgado con la
-// asociacion WiFi todavia viva -- WiFi.status() no lo detecta solo).
-// Lectora+consumidora: wifiConfig_mantener(), que la pone en false apenas
-// la lee (dataPost_debeForzarReconexion()). Esta task NUNCA toca el WiFi
-// directamente -- solo pide, Core1 decide y ejecuta (ver DataPost.h).
-static volatile bool s_forzarReconexion = false;
-
-// resolucion DNS contra un host externo conocido -- liviano (no arma TLS ni
-// hace un POST completo), sirve para distinguir "WiFi asociado pero sin
-// salida real a internet" (router colgado) de "efectivamente sin WiFi"
-// (ya cubierto por wifiOk==false, camino normal de wifiConfig_mantener()).
-static bool hayInternetReal() {
-    IPAddress ip;
-    return WiFi.hostByName("www.google.com", ip);
-}
+// contadores
+static volatile uint32_t s_perdidos   = 0;
+static volatile uint32_t s_entregados = 0;
+static volatile uint32_t s_timeouts   = 0;
+static volatile uint32_t s_ambiguos   = 0;
 
 static void agregarArrayInt(String &json, const char *clave,
                              const NodeReading readings[NUM_NODES],
@@ -121,10 +93,9 @@ static int32_t campoV(const NodeReading &r) { return r.vbat; }
 
 static String armarJson(const NodeReading readings[NUM_NODES], int64_t epochMedidoMs) {
     // "tipo" obligatorio -- lo exige doPost() del lado GAS (ver
-    // procesarMedicion()). "fyhMedido": null (no undefined) si todavia no
-    // hay sync NTP -- new Date(null) en GAS da 1970-01-01, un placeholder
-    // obvio de detectar en el sheet, mejor que "Invalid Date" (lo que daria
-    // omitir el campo).
+    // procesarMedicion()). "fyhMedido": null (no undefined) si no hay hora
+    // real -- new Date(null) en GAS da 1970-01-01, un placeholder obvio de
+    // detectar en el sheet, mejor que "Invalid Date".
     String json = "{\"tipo\":\"medicion\",\"fyhMedido\":";
     if (epochMedidoMs > 0) {
         char buf[24];
@@ -142,31 +113,65 @@ static String armarJson(const NodeReading readings[NUM_NODES], int64_t epochMedi
     return json;
 }
 
-static bool enviarInterno(const NodeReading readings[NUM_NODES], int64_t epochMedidoMs) {
-    String json = armarJson(readings, epochMedidoMs);
+static const char *motivoStr(uint8_t r) {
+    switch ((esp_reset_reason_t)r) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXT";
+        case ESP_RST_SW:        return "SW";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
+    }
+}
+
+// evento de arranque -- "fyh" = hora real al momento de ENVIAR menos el tiempo
+// transcurrido desde el boot (millis()) = instante real del arranque, aunque el
+// envio se haya demorado; null si todavia no hay hora real
+static String armarJsonEvento(const PostItem &it) {
+    String json = "{\"tipo\":\"evento\",\"ev\":\"boot\",\"fyh\":";
+    if (realClock_valido()) {
+        int64_t bootMs = (int64_t)time(nullptr) * 1000LL - (int64_t)millis();
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%lld", (long long)bootMs);
+        json += buf;
+    } else {
+        json += "null";
+    }
+    json += ",\"motivo\":\"";
+    json += motivoStr(it.resetReason);
+    json += "\",\"reinicios\":";
+    json += String((unsigned long)it.reinicios);
+    json += ",\"fw\":\"" GATEWAY_FW_TAG "\"}";
+    return json;
+}
+
+// devuelve el codigo HTTP crudo (302 = GAS termino; negativo = error del
+// cliente HTTP; -100 = http.begin() fallo)
+static int enviarInterno(const PostItem &item) {
+    String json = (item.tipo == TIPO_EVENTO) ? armarJsonEvento(item)
+                                             : armarJson(item.readings, item.epochMedidoMs);
 
     WiFiClientSecure client;
     client.setInsecure();   // sin validar cert de Google, mismo criterio que WifiConfig.cpp
 
     HTTPClient http;
-    if (!http.begin(client, GAS_WEBAPP_URL)) return false;
-    // default (~5000ms) insuficiente -- confirmado en banco (-11 =
-    // HTTPC_ERROR_READ_TIMEOUT): doPost() puede tardar hasta 13s en
-    // ejecutar (Log de Ejecuciones de Apps Script, 2026-08-06), y ese tiempo
-    // va antes del 302 -- 20s da margen aunque las hojas sigan creciendo.
+    if (!http.begin(client, GAS_WEBAPP_URL)) {
+        s_lastHttpCode = -100;
+        s_lastRespSnippet[0] = '\0';
+        return -100;
+    }
+    // doPost() puede tardar hasta decenas de segundos en ejecutar (y mas, ver
+    // DataPost.h) -- 20s de espera, si no llega el 302 a tiempo (-11) el dato
+    // igual se graba del lado de GAS y se da por entregado.
     http.setTimeout(20000);
-    // 2026-08-06: NO seguir el redirect. GAS siempre responde 302 (Location a
-    // script.googleusercontent.com) cuando el script termino sin excepcion no
-    // capturada -- confirmado que ese primer salto SIEMPRE llega bien (datos
-    // grabados, Log de Ejecuciones en "Completada" en todos los casos
-    // probados). El segundo salto (persiguiendo el contenido real via
-    // HTTPC_STRICT_FOLLOW_REDIRECTS) devolvia sistematicamente HTTP 400 +
-    // pagina de error HTML de Google, nunca el JSON real -- causa exacta de
-    // por que la "I" quedaba siempre roja pese a que el dato llegaba. Como
-    // los 4 arrays del firmware siempre tienen 15 elementos por construccion,
-    // el unico caso de {"ok":false} posible del lado de procesarMedicion()
-    // nunca ocurre en la practica -- code==302 es un proxy confiable de
-    // exito, sin necesidad de perseguir el contenido.
+    // NO seguir el redirect: GAS responde 302 cuando el script termino sin
+    // excepcion no capturada -- confirmado en banco que ese primer salto
+    // siempre llega bien y el segundo (seguido como POST) devolvia HTTP 400.
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.addHeader("Content-Type", "application/json");
 
@@ -178,113 +183,188 @@ static bool enviarInterno(const NodeReading readings[NUM_NODES], int64_t epochMe
     strncpy(s_lastRespSnippet, respBody.c_str(), sizeof(s_lastRespSnippet) - 1);
     s_lastRespSnippet[sizeof(s_lastRespSnippet) - 1] = '\0';
 
-    return code == 302;
+    return code;
+}
+
+// -- operaciones de cola (todas bajo mutex) --
+
+static bool peekHead(PostItem &out) {
+    bool ok = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_count > 0) {
+        out = s_ring[s_head];
+        ok = true;
+    }
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+// saca el registro de la cola SOLO si sigue siendo la cabeza (si mientras
+// estaba en vuelo la cola llena lo descarto, no se toca otro)
+static void confirmarEntregado(uint32_t seq) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_count > 0 && s_ring[s_head].seq == seq) {
+        s_head = (uint16_t)((s_head + 1) % s_len);
+        s_count--;
+    }
+    xSemaphoreGive(s_mutex);
+}
+
+// GAS respondio algo que no es 302: cuenta el fallo; al tope lo descarta
+static void marcarFalloHttp(uint32_t seq) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_count > 0 && s_ring[s_head].seq == seq) {
+        s_ring[s_head].fallosHttp++;
+        if (s_ring[s_head].fallosHttp >= DATAPOST_MAX_FALLOS_HTTP) {
+            s_head = (uint16_t)((s_head + 1) % s_len);
+            s_count--;
+            s_perdidos++;
+        }
+    }
+    xSemaphoreGive(s_mutex);
 }
 
 static void dataPostTask(void *param) {
+    (void)param;
     PostItem item;
-    bool    havePending    = false;   // true = "item" es un envio que ya fallo antes, reintentar el MISMO
-    uint8_t fallosSeguidos = 0;
+
     for (;;) {
-        if (!havePending) {
-            if (xQueueReceive(s_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        // en modo de test aislado (sin WifiPower) no hay ventanas: se manda siempre que haya WiFi
+        bool ventanaLibre = !wifiPower_iniciado() ||
+                            (!s_ventanaAgotada && s_enviadosVentana < DATAPOST_MAX_POR_VENTANA);
+
+        if (!wifiPower_enlaceListo() || !ventanaLibre || !peekHead(item)) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
 
-        bool wifiOk = (WiFi.status() == WL_CONNECTED);
-        bool txOk   = wifiOk ? enviarInterno(item.readings, item.epochMedidoMs) : false;
+        if (WiFi.status() != WL_CONNECTED) {   // el enlace se cayo con la ventana abierta
+            s_lastWifiOk = false;
+            s_lastTxOk   = false;
+            s_resultSeq++;
+            s_ventanaAgotada = true;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
 
-        s_lastWifiOk = wifiOk;
-        s_lastTxOk   = txOk;
-        s_resultSeq++;
+        // evento de boot: espera (hasta 30 s tras el arranque) a que haya hora
+        // real, para que "fyh" sea el instante real del boot
+        if (item.tipo == TIPO_EVENTO && !realClock_valido() && millis() < 30000UL) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
-        if (txOk) {
-            havePending    = false;   // se mando -- la proxima vuelta saca el siguiente de la cola
-            fallosSeguidos = 0;
+        s_enVuelo = true;
+        int code = enviarInterno(item);
+        s_enVuelo = false;
+
+        s_lastWifiOk = true;
+
+        if (code == 302 || code == HTTPC_ERROR_READ_TIMEOUT) {
+            // dado por escrito -- ver DataPost.h
+            confirmarEntregado(item.seq);
+            s_enviadosVentana++;
+            s_entregados++;
+            if (code != 302) s_timeouts++;
+            s_lastTxOk = true;
+            DBG("[dp] entregado code=%d (pendientes=%u)\n", code, (unsigned)s_count);
         } else {
-            // 2026-08-07: ya no se reintenta el mismo item -- se descarta y
-            // se cuenta como perdido. Antes se reintentaba cada
-            // DATAPOST_RETRY_DELAY_MS indefinidamente, pero si GAS tardaba
-            // mas que el timeout del cliente (140s vistos en banco, contra
-            // 20s de http.setTimeout()) igual terminaba escribiendo la fila
-            // -- el reintento generaba una segunda ejecucion de doPost() que
-            // tambien la escribia, duplicando la fila en Lecturas/Ledger.
-            // Por ahora se acepta perder esa ronda puntual para medir cuan
-            // seguido pasa esto antes de decidir si hace falta logica de
-            // verificacion contra tipo=ultima.
-            havePending = false;
-            s_perdidos++;
-            fallosSeguidos++;
-
-            // WiFi.status() dice "conectado" pero la TX igual fallo varias
-            // veces seguidas -- puede ser el router colgado (asociacion WiFi
-            // viva, sin salida real a internet). Chequeo liviano de DNS; si
-            // tampoco resuelve, pide a Core1 que fuerce una reconexion
-            // (nunca la ejecuta esta misma task, ver s_forzarReconexion).
-            if (wifiOk && (fallosSeguidos % DATAPOST_CONECTIVIDAD_CADA_N_FALLOS) == 0) {
-                if (!hayInternetReal()) s_forzarReconexion = true;
+            s_lastTxOk = false;
+            s_ventanaAgotada = true;   // no se manda nada mas en esta ventana
+            if (code > 0) {
+                marcarFalloHttp(item.seq);
+            } else if (code == HTTPC_ERROR_SEND_PAYLOAD_FAILED || code == HTTPC_ERROR_CONNECTION_LOST) {
+                s_ambiguos++;
             }
-
-            vTaskDelay(pdMS_TO_TICKS(DATAPOST_RETRY_DELAY_MS));
+            DBG("[dp] NO entregado code=%d resp=%s\n", code, s_lastRespSnippet);
         }
+        s_resultSeq++;
     }
 }
 
 void dataPost_init() {
-    s_queue = xQueueCreate(DATAPOST_QUEUE_LEN, sizeof(PostItem));
+    s_mutex = xSemaphoreCreateMutex();
+
+    // anillo en heap -- si no hay un bloque contiguo del tamaño pedido, achica
+    s_len = DATAPOST_QUEUE_LEN;
+    while (s_len >= 16) {
+        s_ring = (PostItem *)malloc(sizeof(PostItem) * s_len);
+        if (s_ring) break;
+        s_len /= 2;
+    }
+    if (!s_ring) s_len = 0;
+    s_head = 0;
+    s_count = 0;
+
     xTaskCreatePinnedToCore(dataPostTask, "dataPostTask",
                              DATAPOST_TASK_STACK_BYTES, nullptr, 1, nullptr,
                              DATAPOST_TASK_CORE);
 }
 
 void dataPost_encolar(const NodeReading readings[NUM_NODES], int64_t epochMedidoMs) {
-    if (!s_queue) return;
-    PostItem item;
-    memcpy(item.readings, readings, sizeof(item.readings));
-    item.epochMedidoMs = epochMedidoMs;
-    // timeout 0 -- nunca bloquea Core 1. Buffer circular: si esta llena
-    // (corte de internet mas largo que DATAPOST_QUEUE_LEN*intervalo), se
-    // descarta el registro MAS VIEJO para hacer lugar al nuevo -- prioridad
-    // a conservar siempre los ultimos ~2 dias, no los primeros del corte.
-    if (xQueueSend(s_queue, &item, 0) != pdTRUE) {
-        PostItem descartado;
-        xQueueReceive(s_queue, &descartado, 0);   // saca el mas viejo (no bloqueante)
-        xQueueSend(s_queue, &item, 0);            // ahora hay lugar
+    if (!s_ring || s_len == 0) return;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_count >= s_len) {
+        // llena: se descarta el MAS VIEJO -- prioridad a conservar lo ultimo
+        s_head = (uint16_t)((s_head + 1) % s_len);
+        s_count--;
+        s_perdidos++;
     }
+    PostItem &dst = s_ring[(s_head + s_count) % s_len];
+    memcpy(dst.readings, readings, sizeof(dst.readings));
+    dst.epochMedidoMs = epochMedidoMs;
+    dst.seq           = s_nextSeq++;
+    dst.fallosHttp    = 0;
+    dst.tipo          = TIPO_MEDICION;
+    dst.resetReason   = 0;
+    dst.reinicios     = 0;
+    s_count++;
+    xSemaphoreGive(s_mutex);
 }
 
-bool dataPost_ultimoOk() {
-    return s_lastTxOk;
-}
+void dataPost_encolarBoot(uint8_t resetReason, uint32_t reinicios) {
+    if (!s_ring || s_len == 0) return;
 
-bool dataPost_ultimoWifiOk() {
-    return s_lastWifiOk;
-}
-
-uint32_t dataPost_resultSeq() {
-    return s_resultSeq;
-}
-
-int dataPost_ultimoCode() {
-    return s_lastHttpCode;
-}
-
-const char *dataPost_ultimoResp() {
-    return s_lastRespSnippet;
-}
-
-uint16_t dataPost_pendientes() {
-    if (!s_queue) return 0;
-    return (uint16_t)uxQueueMessagesWaiting(s_queue);
-}
-
-uint32_t dataPost_perdidos() {
-    return s_perdidos;
-}
-
-bool dataPost_debeForzarReconexion() {
-    if (s_forzarReconexion) {
-        s_forzarReconexion = false;   // consumido -- se lee 1 sola vez
-        return true;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_count >= s_len) {
+        s_head = (uint16_t)((s_head + 1) % s_len);
+        s_count--;
+        s_perdidos++;
     }
-    return false;
+    PostItem &dst = s_ring[(s_head + s_count) % s_len];
+    memset(dst.readings, 0, sizeof(dst.readings));
+    dst.epochMedidoMs = 0;
+    dst.seq           = s_nextSeq++;
+    dst.fallosHttp    = 0;
+    dst.tipo          = TIPO_EVENTO;
+    dst.resetReason   = resetReason;
+    dst.reinicios     = reinicios;
+    s_count++;
+    xSemaphoreGive(s_mutex);
 }
+
+void dataPost_nuevaVentana() {
+    s_enviadosVentana = 0;
+    s_ventanaAgotada  = false;
+}
+
+bool dataPost_enVuelo() {
+    return s_enVuelo;
+}
+
+bool dataPost_inactivo() {
+    if (s_enVuelo) return false;
+    return s_count == 0 || s_ventanaAgotada || s_enviadosVentana >= DATAPOST_MAX_POR_VENTANA;
+}
+
+bool dataPost_ultimoOk()          { return s_lastTxOk; }
+bool dataPost_ultimoWifiOk()      { return s_lastWifiOk; }
+uint32_t dataPost_resultSeq()     { return s_resultSeq; }
+int dataPost_ultimoCode()         { return s_lastHttpCode; }
+const char *dataPost_ultimoResp() { return s_lastRespSnippet; }
+uint16_t dataPost_pendientes()    { return s_count; }
+uint32_t dataPost_perdidos()      { return s_perdidos; }
+uint32_t dataPost_entregados()    { return s_entregados; }
+uint32_t dataPost_timeouts()      { return s_timeouts; }
+uint32_t dataPost_ambiguos()      { return s_ambiguos; }

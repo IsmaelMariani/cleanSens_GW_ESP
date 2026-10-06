@@ -1,6 +1,8 @@
+// 2026-09-30 20:36 - Debug: credenciales entre comillas y estado WiFi
+// 2026-09-30 19:23 - mantener() sin reconexion forzada; on/off radio
 #include "WifiConfig.h"
 #include "GasConfig.h"
-#include "DataPost.h"
+#include "GatewayConfig.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -25,6 +27,14 @@
 
 #define WIFI_CONNECT_TIMEOUT_MS  8000   // por intento -- generoso para asociacion+DHCP
 #define WIFI_CONNECT_ATTEMPTS    3      // solo para la credencial activa, ver wifiConfig_conectar()
+
+// 2026-09-03: 1 = imprime por Serial que credencial esta probando en cada
+// paso (fallback/activa), para diagnosticar en banco que hay realmente en
+// flash. SOLO valido junto con WIFICONFIG_STANDALONE_TEST=1 en el .ino
+// (Serial=USB libre) -- en produccion Serial es la UART del PIC, dejar esto
+// en 1 ahi mete basura en el protocolo binario. Volver a 0 al terminar de
+// diagnosticar.
+#define WIFICONFIG_DEBUG_SERIAL 0
 
 static Preferences prefs;
 
@@ -56,11 +66,19 @@ void wifiConfig_init() {
     s_pass   = prefs.getString("pass", "");
     s_ssidFb = prefs.getString("ssidFb", "");
     s_passFb = prefs.getString("passFb", "");
+
+    DBG("[wifi] flash: activa=\"%s\" / \"%s\"  celu=\"%s\" / \"%s\"\n",
+        s_ssid.c_str(), s_pass.c_str(), s_ssidFb.c_str(), s_passFb.c_str());
 }
 
-static bool intentarConectar(const String &ssid, const String &pass, uint8_t intentos) {
-    if (ssid.length() == 0) return false;
+static bool intentarConectar(const char *tag, const String &ssid, const String &pass, uint8_t intentos) {
+    if (ssid.length() == 0) {
+        DBG("[wifi] %s: SSID vacio, no se intenta\n", tag);
+        return false;
+    }
     for (uint8_t i = 0; i < intentos; i++) {
+        DBG("[wifi] %s intento %u/%u: ssid=\"%s\" pass=\"%s\"\n", tag, (unsigned)(i + 1), (unsigned)intentos,
+            ssid.c_str(), pass.c_str());
         WiFi.disconnect(true);
         // delay obligatorio -- WiFi.begin() llamado inmediatamente despues
         // de disconnect(true) sobre una conexion QUE YA ESTABA activa
@@ -73,9 +91,15 @@ static bool intentarConectar(const String &ssid, const String &pass, uint8_t int
         WiFi.begin(ssid.c_str(), pass.c_str());
         unsigned long t0 = millis();
         while ((unsigned long)(millis() - t0) < WIFI_CONNECT_TIMEOUT_MS) {
-            if (WiFi.status() == WL_CONNECTED) return true;
+            if (WiFi.status() == WL_CONNECTED) {
+                DBG("[wifi] %s conectado en %lu ms, ip=%s rssi=%d\n", tag, (unsigned long)(millis() - t0),
+                    WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+                return true;
+            }
             delay(100);
         }
+        // WiFi.status(): 0=IDLE 1=NO_SSID_AVAIL 3=CONNECTED 4=CONNECT_FAILED 5=CONNECTION_LOST 6=DISCONNECTED
+        DBG("[wifi] %s intento %u sin conexion, WiFi.status()=%d\n", tag, (unsigned)(i + 1), (int)WiFi.status());
     }
     return false;
 }
@@ -104,9 +128,14 @@ void wifiConfig_conectar() {
     // instalador necesita cambiar la credencial activa, la actualiza via
     // Config_WiFi/GAS (conectado por celu en ese momento) y resetea la
     // placa, no hace falta logica de "probar la nueva al toque".
-    if (intentarConectar(s_ssidFb, s_passFb, 1)) return;
+    if (intentarConectar("celu", s_ssidFb, s_passFb, 1)) return;
 
-    intentarConectar(s_ssid, s_pass, WIFI_CONNECT_ATTEMPTS);
+#if WIFICONFIG_DEBUG_SERIAL
+    Serial.printf("[WifiConfig] fallback (%s) no conecto, probando activa: \"%s\" / \"%s\"\n",
+                  s_ssidFb.c_str(), s_ssid.c_str(), s_pass.c_str());
+#endif
+
+    intentarConectar("activa", s_ssid, s_pass, WIFI_CONNECT_ATTEMPTS);
 }
 
 bool wifiConfig_conectado() {
@@ -143,16 +172,23 @@ bool wifiConfig_actualizarDesdeSheet() {
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GAS responde con 302 antes del JSON real
 
     int code = http.GET();
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) {
+        DBG("[wifi] Config_WiFi: GET code=%d (se espera 200)\n", code);
+        http.end();
+        return false;
+    }
     String body = http.getString();
     http.end();
 
-    if (extraerCampoJson(body, "flag") != "S") return false;   // "N" o respuesta invalida -- no toca flash
+    String flagLeido = extraerCampoJson(body, "flag");
+    DBG("[wifi] Config_WiFi: GET 200, flag=\"%s\"\n", flagLeido.c_str());
+    if (flagLeido != "S") return false;   // "N" o respuesta invalida -- no toca flash
 
     String ssid = extraerCampoJson(body, "ssid");
     String pass = extraerCampoJson(body, "pass");
     if (ssid.length() == 0) return false;
 
+    DBG("[wifi] Config_WiFi: credencial nueva ssid=\"%s\" pass=\"%s\"\n", ssid.c_str(), pass.c_str());
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
     s_ssid = ssid;   // cache en RAM al dia -- ver comentario grande junto a su declaracion
@@ -190,40 +226,18 @@ void wifiConfig_bootstrap() {
 
         if (!wifiConfig_actualizarDesdeSheet()) return;
 
-        if (intentarConectar(s_ssid, s_pass, WIFI_CONNECT_ATTEMPTS)) return;
+        if (intentarConectar("activa-nueva", s_ssid, s_pass, WIFI_CONNECT_ATTEMPTS)) return;
     }
 }
 
 #define WIFI_RECONNECT_INTERVAL_MS  30000   // cada cuanto reintenta si esta caido
 
-// 2026-08-06: reconexion forzada -- DataPost.cpp (Core0) puede detectar que
-// WiFi.status() dice "conectado" pero no hay internet real (router colgado,
-// asociacion WiFi viva) y pedir (nunca ejecutar) que se fuerce una
-// reconexion aca, el unico lugar que toca el WiFi. Maquina de 2 pasos
-// repartida en varias vueltas de loop() (nunca un delay() bloqueante):
-// WiFi.disconnect() en esta vuelta, WiFi.reconnect() recien pasados los
-// ~200ms del bug ya conocido (ver intentarConectar()) en una vuelta
-// posterior -- sin bloquear Core1/picLink_poll() en ningun momento.
-enum ForzarReconexionState { FR_IDLE, FR_ESPERANDO_RECONECTAR };
-static ForzarReconexionState frState        = FR_IDLE;
-static unsigned long         frDisconnectMs = 0;
-
+// 2026-09-30: la reconexion forzada pedida por DataPost (router colgado con la
+// asociacion viva) se saco -- con el radio ciclico (WifiPower.cpp) cada ventana
+// reconstruye la conexion desde cero, y un pedido pendiente podia dispararse
+// al abrir la ventana siguiente. wifiConfig_mantener() ahora solo se usa
+// durante la ventana de instalacion del boot (WifiPower.cpp).
 void wifiConfig_mantener() {
-    if (frState == FR_ESPERANDO_RECONECTAR) {
-        if ((unsigned long)(millis() - frDisconnectMs) >= 200) {
-            WiFi.reconnect();
-            frState = FR_IDLE;
-        }
-        return;   // nada mas esta vuelta -- ni chequeo de "conectado" ni timer normal
-    }
-
-    if (dataPost_debeForzarReconexion()) {
-        WiFi.disconnect(true);
-        frDisconnectMs = millis();
-        frState        = FR_ESPERANDO_RECONECTAR;
-        return;
-    }
-
     if (wifiConfig_conectado()) return;
 
     static unsigned long lastAttempt = 0;
@@ -238,5 +252,23 @@ void wifiConfig_mantener() {
     // de instalar (ver wifiConfig_conectar()), nunca para reconexion en
     // operacion. WiFi.begin() no bloquea (a diferencia de intentarConectar()).
     if (s_ssid.length() == 0) return;
+    DBG("[wifi] reintento: activa ssid=\"%s\" pass=\"%s\"\n", s_ssid.c_str(), s_pass.c_str());
     WiFi.begin(s_ssid.c_str(), s_pass.c_str());
+}
+
+// 2026-09-30: prende el radio y empieza a conectar a la credencial ACTIVA (no
+// bloquea, el llamador pollea WiFi.status()). Solo la usa WifiPower.cpp.
+void wifiConfig_iniciarConexion() {
+    WiFi.mode(WIFI_STA);
+    WiFi.persistent(false);
+    WiFi.setSleep(false);   // ventana corta: conviene terminar rapido, no ahorrar durante ella
+    if (s_ssid.length() == 0) return;
+    DBG("[wifi] ventana: activa ssid=\"%s\" pass=\"%s\"\n", s_ssid.c_str(), s_pass.c_str());
+    WiFi.begin(s_ssid.c_str(), s_pass.c_str());
+}
+
+// apaga el radio de verdad (esp_wifi_stop) -- consumo. Solo la usa WifiPower.cpp.
+void wifiConfig_apagar() {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
 }

@@ -1,3 +1,4 @@
+// 2026-09-30 19:23 - resincronizar() por ventana de radio
 #pragma once
 
 #include <stdint.h>
@@ -31,3 +32,11 @@ void realClock_obtener(uint8_t &day, uint8_t &month, uint8_t &year,
 // epoch actual en milisegundos, 0 si todavia no sincronizo -- para
 // fyhMedido del POST (ver DataPost.cpp).
 int64_t realClock_epochMs();
+
+// 2026-09-30: con el radio apagado entre ventanas el cliente SNTP no puede
+// corregir el drift del cristal -- WifiPower.cpp llama a esto al abrir cada
+// ventana (radio ya conectado) para forzar un sync inmediato, y consulta
+// realClock_sincronizoReciente() para saber si el servidor contesto (true
+// desde la ultima llamada a realClock_resincronizar()).
+void realClock_resincronizar();
+bool realClock_sincronizoReciente();

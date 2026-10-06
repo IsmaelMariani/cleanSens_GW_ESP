@@ -1,3 +1,4 @@
+// 2026-09-30 19:23 - AVERAGER_INTERVAL_MIN = 15
 #pragma once
 
 #include "SharedTypes.h"
@@ -21,7 +22,7 @@
 // resto del proyecto.
 // =============================================================
 
-#define AVERAGER_INTERVAL_MIN  2   // TEMPORAL -- reflashear cuando el cliente defina el intervalo real (5/10/15/30min)
+#define AVERAGER_INTERVAL_MIN  15   // 2026-09-30: bloque unico de 15 min, media directa de las lecturas validas (definitivo)
 
 void averager_init();
 

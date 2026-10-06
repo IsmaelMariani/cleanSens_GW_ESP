@@ -1,3 +1,4 @@
+// 2026-09-30 19:23 - Agrega iniciarConexion()/apagar() del radio
 #pragma once
 
 #include <stdint.h>
@@ -46,15 +47,21 @@ bool wifiConfig_actualizarDesdeSheet();
 // WifiConfig.cpp para la secuencia completa.
 void wifiConfig_bootstrap();
 
-// Llamar 1x por vuelta de loop() (produccion) -- si esta desconectado,
-// reintenta cada WIFI_RECONNECT_INTERVAL_MS con WiFi.begin() apuntando
-// SIEMPRE a la credencial activa (NO bloqueante) -- nunca al celu, ni
-// siquiera si el boot conecto por ahi (instalacion). No repite el bootstrap
-// completo (eso bloquearia loop() varios segundos y arruinaria el timing de
-// picLink_poll() con el PICG).
+// 2026-09-30: solo la llama WifiPower.cpp (task de Core 0) durante la ventana
+// de instalacion del boot -- si esta desconectado, reintenta cada
+// WIFI_RECONNECT_INTERVAL_MS con WiFi.begin() apuntando SIEMPRE a la
+// credencial activa (NO bloqueante) -- nunca al celu. Ya no se llama desde
+// loop().
 void wifiConfig_mantener();
 
+// 2026-09-30: control del radio para el ciclo de ventanas (WifiPower.cpp,
+// unico que las llama). iniciarConexion(): prende el radio y empieza a
+// conectar a la credencial activa, NO bloquea (quien llama pollea
+// WiFi.status()). apagar(): apaga el radio de verdad.
+void wifiConfig_iniciarConexion();
+void wifiConfig_apagar();
+
 // Solo debug -- credenciales actuales en flash, "ssid / pass" en texto
-// plano. Nunca llamar con el PIC conectado (comparte Serial/UART0).
+// plano. Solo debug (Serial, UART0; el PIC va por Serial2 desde 2026-09-30).
 String wifiConfig_activaStr();
 String wifiConfig_fallbackStr();

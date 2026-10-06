@@ -1,4 +1,6 @@
+// 2026-09-30 17:03 - Serial -> Serial2 (GPIO16/17)
 #include "PicLink.h"
+#include "gateway_pinout.h"
 #include <Arduino.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -8,10 +10,9 @@
 // =============================================================
 // PicLink.cpp -- ver PicLink.h para el diseño del protocolo.
 //
-// Usa Serial (UART0, GPIO1/GPIO3) -- el PIC esta conectado al conector de
-// alimentacion de la placa (P1 en el ESP32-2432S028R/CYD), que es UART0, el
-// mismo que el chip USB-serie de a bordo. Por esto no se puede usar
-// Serial.print() para debug ni conectar el USB al mismo tiempo que el PIC.
+// Usa Serial2 (UART2, GPIO16 RX / GPIO17 TX, ver gateway_pinout.h) -- desde
+// 2026-09-30, sobre ESP32-WROOM NodeMCU de 38 pines. Serial (UART0, el del USB
+// de programacion) queda libre para debug.
 // =============================================================
 
 // 2026-07-31: sin fraccion/segundero/minuto (12->8 bytes) -- el nodo no manda
@@ -86,7 +87,7 @@ static void blankReading(NodeReading &r) {
 }
 
 void picLink_init() {
-    Serial.begin(19200, SERIAL_8N1);   // UART0 -- GPIO1/GPIO3 fijos, sin pines a elegir
+    Serial2.begin(19200, SERIAL_8N1, PIN_PIC_RX, PIN_PIC_TX);   // UART2 -- GPIO16 RX / GPIO17 TX
     for (uint8_t i = 0; i < NUM_NODES; i++) tocadoEstaRonda[i] = false;
 }
 
@@ -114,7 +115,7 @@ static PicLinkEvent handleFrame(NodeReading readings[NUM_NODES], uint8_t fino, u
         ack[2] = w.addr;
         ack[3] = (uint8_t)(ack[1] ^ ack[2]);
         ack[4] = 0x55;
-        Serial.write(ack, sizeof(ack));
+        Serial2.write(ack, sizeof(ack));
 
         if (w.addr >= 1 && w.addr <= NUM_NODES) {
             convertNode(w, readings[w.addr - 1]);
@@ -166,7 +167,7 @@ static PicLinkEvent handleFrame(NodeReading readings[NUM_NODES], uint8_t fino, u
         ack[4] = segundero;
         ack[5] = (uint8_t)(ack[1] ^ ack[2] ^ ack[3] ^ ack[4]);
         ack[6] = 0x55;
-        Serial.write(ack, sizeof(ack));
+        Serial2.write(ack, sizeof(ack));
 
         // cierre de ronda -- blanquea las UTAs que no llegaron esta vuelta,
         // recien ahi resetea el marcador para la ronda que arranca. Este es
@@ -189,8 +190,8 @@ static PicLinkEvent handleFrame(NodeReading readings[NUM_NODES], uint8_t fino, u
 PicLinkEvent picLink_poll(NodeReading readings[NUM_NODES], uint8_t fino, uint8_t segundero) {
     PicLinkEvent result = PicLinkEvent::NONE;
 
-    while (Serial.available() && result == PicLinkEvent::NONE) {
-        uint8_t b = (uint8_t)Serial.read();
+    while (Serial2.available() && result == PicLinkEvent::NONE) {
+        uint8_t b = (uint8_t)Serial2.read();
         unsigned long now = millis();
 
         if (rxIdx == 0) {
