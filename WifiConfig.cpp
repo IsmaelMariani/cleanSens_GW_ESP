@@ -1,3 +1,4 @@
+// 2026-10-15 10:27 - WPA3: SAE PWE both (wifiBegin)
 // 2026-09-30 20:36 - Debug: credenciales entre comillas y estado WiFi
 // 2026-09-30 19:23 - mantener() sin reconexion forzada; on/off radio
 #include "WifiConfig.h"
@@ -5,6 +6,7 @@
 #include "GatewayConfig.h"
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -71,6 +73,21 @@ void wifiConfig_init() {
         s_ssid.c_str(), s_pass.c_str(), s_ssidFb.c_str(), s_passFb.c_str());
 }
 
+// WPA3-Personal: acepta SAE hunt-and-peck y H2E. WiFi.begin() de este core
+// (2.0.17, IDF 4.4.7) arma la config desde cero con sae_pwe_h2e en 0 = solo el
+// metodo viejo, y un router WPA3 que exija H2E no conectaria. begin(...,
+// connect=false) arma la config sin conectar; se parchea y recien ahi se
+// conecta. WPA2 sigue funcionando igual.
+static void wifiBegin(const char *ssid, const char *pass) {
+    WiFi.begin(ssid, pass, 0, NULL, false);
+    wifi_config_t cfg;
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK) {
+        cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+        esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    }
+    esp_wifi_connect();
+}
+
 static bool intentarConectar(const char *tag, const String &ssid, const String &pass, uint8_t intentos) {
     if (ssid.length() == 0) {
         DBG("[wifi] %s: SSID vacio, no se intenta\n", tag);
@@ -88,7 +105,7 @@ static bool intentarConectar(const char *tag, const String &ssid, const String &
         // banco 2026-08-05 (fallaba el primer ciclo de reconexion de
         // DataPost, el que corre con WiFi ya conectado desde el boot).
         delay(200);
-        WiFi.begin(ssid.c_str(), pass.c_str());
+        wifiBegin(ssid.c_str(), pass.c_str());
         unsigned long t0 = millis();
         while ((unsigned long)(millis() - t0) < WIFI_CONNECT_TIMEOUT_MS) {
             if (WiFi.status() == WL_CONNECTED) {
@@ -253,7 +270,7 @@ void wifiConfig_mantener() {
     // operacion. WiFi.begin() no bloquea (a diferencia de intentarConectar()).
     if (s_ssid.length() == 0) return;
     DBG("[wifi] reintento: activa ssid=\"%s\" pass=\"%s\"\n", s_ssid.c_str(), s_pass.c_str());
-    WiFi.begin(s_ssid.c_str(), s_pass.c_str());
+    wifiBegin(s_ssid.c_str(), s_pass.c_str());
 }
 
 // 2026-09-30: prende el radio y empieza a conectar a la credencial ACTIVA (no
@@ -264,7 +281,7 @@ void wifiConfig_iniciarConexion() {
     WiFi.setSleep(false);   // ventana corta: conviene terminar rapido, no ahorrar durante ella
     if (s_ssid.length() == 0) return;
     DBG("[wifi] ventana: activa ssid=\"%s\" pass=\"%s\"\n", s_ssid.c_str(), s_pass.c_str());
-    WiFi.begin(s_ssid.c_str(), s_pass.c_str());
+    wifiBegin(s_ssid.c_str(), s_pass.c_str());
 }
 
 // apaga el radio de verdad (esp_wifi_stop) -- consumo. Solo la usa WifiPower.cpp.
