@@ -1,3 +1,4 @@
+// 2026-10-06 17:36 - delay(1) al final de loop()
 // 2026-10-05 09:40 - CPU fija a 80 MHz en setup()
 // 2026-09-30 19:44 - Evento boot (motivo de reset + contador) a GAS
 // 2026-09-30 19:23 - Ciclo de radio, bloques 15 min, FASTTEST
@@ -311,6 +312,11 @@ void loop() {
             (int)wifiPower_enlaceListo());
     }
 #endif
+
+    // cede el CPU a la tarea idle (clock-gating del core hasta la proxima
+    // interrupcion): loop() dejaba de girar a full. Los bytes del PIC entran
+    // por ISR al FIFO/buffer de Serial2 (256 B), 1 ms = ~2 bytes a 19200.
+    delay(1);
 }
 
 #endif  // WIFICONFIG_STANDALONE_TEST
